@@ -1,18 +1,11 @@
-set(controller_SRC NewFSMController.cpp)
+set(controller_SRC CallmWbcController.cpp)
 
-set(controller_HDR NewFSMController.h)
+set(controller_HDR CallmWbcController.h api.h)
 
-add_library(${PROJECT_NAME} SHARED ${controller_SRC} ${controller_HDR})
+# add_controller is provided by mc_rtc: it builds a shared controller module and
+# links it against mc_rtc::mc_control. The UR5e and TriOrb robot modules are loaded
+# at runtime (plugins), so they are build-ordering dependencies handled by the
+# superbuild AddProject DEPENDS, not link-time dependencies of this target.
+add_controller(${PROJECT_NAME} ${controller_SRC} ${controller_HDR})
 set_target_properties(${PROJECT_NAME} PROPERTIES COMPILE_FLAGS
-                                                 "-DNewFSMController_EXPORTS")
-target_link_libraries(${PROJECT_NAME} PUBLIC mc_rtc::mc_control_fsm)
-install(
-  TARGETS ${PROJECT_NAME}
-  ARCHIVE DESTINATION "${MC_RTC_LIBDIR}"
-  LIBRARY DESTINATION "${MC_RTC_LIBDIR}"
-  RUNTIME DESTINATION bin)
-
-add_controller(${PROJECT_NAME}_controller lib.cpp "")
-target_link_libraries(${PROJECT_NAME}_controller PUBLIC ${PROJECT_NAME})
-
-add_subdirectory(states)
+                                                 "-DCallmWbcController_EXPORTS")

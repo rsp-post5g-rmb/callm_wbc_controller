@@ -1,7 +1,8 @@
-# This configuration is used to run a few iterations of the controller
-MainRobot: JVRC1
-Enabled: NewFSMController
+# This configuration is used to run a few iterations of the controller as a smoke
+# test. It requires the UR5e and TriOrb robot modules to be available on the module
+# path (they are, when built inside mc_rtc_superbuild).
+MainRobot: UR5eFloatingBase
+Enabled: CallmWbcController
 
-IncludeHalfSitController: false
 ClearControllerModulePath: true
-ControllerModulePaths: ["$<TARGET_FILE_DIR:NewFSMController>"]
+ControllerModulePaths: ["$<TARGET_FILE_DIR:CallmWbcController>"]

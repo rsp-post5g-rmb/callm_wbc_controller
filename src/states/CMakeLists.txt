@@ -1,3 +1,0 @@
-add_fsm_state_simple(NewFSMController_Initial)
-
-add_fsm_data_directory(data)

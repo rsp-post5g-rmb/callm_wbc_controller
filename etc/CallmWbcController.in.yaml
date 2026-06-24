@@ -1,0 +1,35 @@
+---
+# Controller configuration for the CallmWbcController.
+#
+# MainRobot / Enabled are the keys mc_rtc reads to pick the main robot and the
+# active controller. They are repeated here (as required by the task spec) but
+# they only take effect from the global mc_rtc.yaml used to launch the framework,
+# so make sure your run-time mc_rtc.yaml mirrors them:
+#
+#   MainRobot: UR5eFloatingBase
+#   Enabled: CallmWbcController
+#
+MainRobot: UR5eFloatingBase
+Enabled: CallmWbcController
+
+# ---- Whole-body task gains -------------------------------------------------
+# Arm end-effector task (UR5e "Tool" surface, robot 0).
+ee_task:
+  stiffness: 5.0
+  weight: 1000.0
+
+# Base command task (TriOrb "base" body, robot 1). Drives base_x / base_y /
+# base_yaw to reach the commanded planar pose.
+base_task:
+  stiffness: 2.0
+  weight: 1000.0
+
+# UR5e posture task (robot 0) -- resolves arm redundancy in the EE null space.
+ur5e_posture:
+  stiffness: 10.0
+  weight: 5.0
+
+# TriOrb posture task (robot 1) -- light regularization of the base joints.
+triorb_posture:
+  stiffness: 1.0
+  weight: 1.0

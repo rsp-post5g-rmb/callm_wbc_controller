@@ -1,4 +1,4 @@
-name: CI of NewFSMController
+name: CI of CallmWbcController
 
 on:
   push:
