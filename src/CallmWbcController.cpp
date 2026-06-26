@@ -1,5 +1,6 @@
 #include "CallmWbcController.h"
 
+#include <mc_rbdyn/Collision.h>
 #include <mc_rbdyn/PlanarSurface.h>
 #include <mc_rbdyn/RobotLoader.h>
 
@@ -55,6 +56,32 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   // mobile-arm tutorial, the TriOrb module is fixed-base with explicit planar
   // joints (base_x / base_y / base_yaw), so its planar motion is intrinsic to the
   // kinematics and is solved directly by the QP through those joints.
+
+  // ---- Arm <-> base collision avoidance ------------------------------------
+  // mc_rtc auto-builds an sch::S_Box collision convex named "base" for the TriOrb
+  // base link directly from the URDF <box> collision primitive, so no extra hull
+  // file is needed. We guard the distal arm links against that box. base_link and
+  // shoulder_link are intentionally excluded: the arm base is rigidly mounted on
+  // top of the base, so they sit permanently against it by design. (UR5e internal
+  // self-collisions are already covered by selfCollisionConstraint.)
+  bool enableArmBaseCollision = true;
+  double ciDist = 0.05; // interaction distance: avoidance starts engaging here
+  double csDist = 0.02; // safety distance: hard lower bound on separation
+  std::vector<std::string> armLinks = {"forearm_link", "wrist_1_link", "wrist_2_link", "wrist_3_link"};
+  if(config.has("arm_base_collision"))
+  {
+    auto c = config("arm_base_collision");
+    c("enable", enableArmBaseCollision);
+    c("iDist", ciDist);
+    c("sDist", csDist);
+    c("arm_links", armLinks);
+  }
+  if(enableArmBaseCollision)
+  {
+    std::vector<mc_rbdyn::Collision> armBaseCollisions;
+    for(const auto & link : armLinks) { armBaseCollisions.push_back({link, "base", ciDist, csDist, 0.0}); }
+    addCollisions("ur5e", "triorb", armBaseCollisions);
+  }
 
   setupTargetsIO();
 

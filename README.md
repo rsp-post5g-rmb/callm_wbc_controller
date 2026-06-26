@@ -33,6 +33,11 @@ Tasks / constraints
 
 - `contactConstraint`, `kinematicsConstraint` (UR5e), `selfCollisionConstraint` (UR5e),
   plus a per-robot `KinematicsConstraint` for the TriOrb.
+- **Arm&harr;base collision avoidance** via `addCollisions("ur5e", "triorb", ...)`.
+  mc_rtc auto-builds an `sch::S_Box` collision convex (named `base`) from the TriOrb
+  URDF `<box>` collision primitive, so no hull file is needed. The guarded links and
+  the interaction/safety distances are set in `arm_base_collision` in the YAML;
+  `base_link`/`shoulder_link` are excluded since the arm base is mounted on the base.
 - `SurfaceTransformTask` on the UR5e `Tool` surface (arm end-effector).
 - `TransformTask` on the TriOrb `base` body (base command).
 - `PostureTask` for the UR5e (arm redundancy) and a light `PostureTask` for the base.
