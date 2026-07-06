@@ -30,3 +30,7 @@ configure_file(etc/CallmWbcController.in.yaml
                "${CMAKE_CURRENT_BINARY_DIR}/etc/CallmWbcController.yaml")
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/etc/CallmWbcController.yaml"
         DESTINATION "${MC_CONTROLLER_RUNTIME_INSTALL_PREFIX}/etc")
+
+# Install the example hardware run configuration (mc_rtde + base/gripper plugins).
+install(FILES etc/mc_rtde_callm.yaml
+        DESTINATION "${MC_CONTROLLER_RUNTIME_INSTALL_PREFIX}/etc")

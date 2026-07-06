@@ -29,10 +29,72 @@ ur5e_posture:
   stiffness: 10.0
   weight: 5.0
 
+# Base command task (robot 1). Drives base_x / base_y / base_yaw. In the active
+# config the base is commanded by velocity_base (integrated into this task's target
+# with a body-velocity feed-forward). `damping` is optional: mc_rtc has NO generic
+# "damping task" (mc_tasks::force::DampingTask is an admittance/force task needing a
+# force sensor), so base damping is just this trajectory task's damping coefficient.
+# Leave it commented to use the default (2*sqrt(stiffness)).
+# base_task:
+#   damping: 4.0
+
+# How the base is driven: "velocity" (active -- from velocity_base) or "pose"
+# (inactive/overridable -- from the Base target [world] GUI marker / BASE_TARGET_KEY).
+base_command:
+  mode: velocity
+
 # TriOrb posture task (robot 1) -- light regularization of the base joints.
 triorb_posture:
   stiffness: 1.0
   weight: 1.0
+
+# Robotiq gripper posture task (robot 3) -- holds the knuckle joints of the model.
+gripper_posture:
+  stiffness: 1.0
+  weight: 1.0
+
+# ---- Robotiq gripper -------------------------------------------------------
+# The gripper is a separate ConnectableRobotModule (mc_robot_tools) loaded as an
+# extra robot and bolted onto the UR5e "Tool" surface in reset(). Commanding the
+# physical gripper is done through the mc_robotiq GlobalPlugin datastore call
+# `RobotiqGripper::setOpening` (0 = open, 1 = closed); enable that plugin in the
+# global mc_rtc.yaml (see tests/etc/mc_rtc.yaml). If the module/plugin are absent
+# the controller runs without the gripper.
+gripper:
+  enable: true
+  model: Robotiq2f85Gripper        # or Robotiq2f140Gripper
+  set_opening_call: "RobotiqGripper::setOpening"
+
+# ---- ROS2 command client ---------------------------------------------------
+# A WbcData message (std_msgs/Float64MultiArray, 20 doubles -- see WbcData.h) is
+# received on command_topic and applied every loop; measured state is republished
+# on measured_topic. The node spins on its own thread/context.
+ros:
+  node_name: callm_wbc_controller
+  command_topic: "callm_wbc/command"
+  measured_topic: "callm_wbc/measured"
+  publish_measured: true
+  publish_decimation: 10
+
+# ---- Base state (SLAM) + base-velocity export ------------------------------
+# The base is velocity-controlled hardware: its STATE is grounded every tick from
+# a SLAM pose topic (geometry_msgs/PoseStamped), and the QP-realized base velocity
+# is exported (body frame) to the TriorbBasePlugin via its `command_key`
+# (Triorb::cmd_velocity). Set the plugin's `command_in_world_frame: false` to match.
+#
+#   slam_frame:
+#     "capture_offset" -> grab the first SLAM pose at reset() as the map->world
+#                         offset (robust; works whatever the SLAM map origin is).
+#     "world"          -> use the SLAM pose raw (map == controller world; valid when
+#                         SLAM zeroes its origin to the robot at each episode start).
+# With no SLAM publisher / no TriorbBasePlugin (e.g. pure RViZ sim) both paths are
+# inert and the base is driven by the in-QP velocity integration as before.
+base_state:
+  from_slam: true
+  slam_topic: "/robot_pose_slam"
+  slam_frame: world          # this rig zeroes SLAM origin per episode -> map == world
+  slam_timeout: 0.5          # s; hold-last + warn once beyond this
+  command_key: "Triorb::cmd_velocity"
 
 # ---- Arm <-> base collision avoidance --------------------------------------
 # Keeps the listed UR5e links clear of the TriOrb base box. The "base" convex is

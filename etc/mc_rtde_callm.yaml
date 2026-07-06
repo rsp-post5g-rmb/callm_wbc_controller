@@ -1,0 +1,56 @@
+---
+# ===========================================================================
+# Example GLOBAL mc_rtc configuration to run CallmWbcController on hardware via
+# the mc_rtde interface (MCControlRtde -f mc_rtde_callm.yaml).
+#
+# One MCGlobalController loop:
+#   - mc_rtde     drives the UR5e arm (position mode, over RTDE)
+#   - TriorbBasePlugin   drives the TriOrb base (serial, off the RT loop)
+#   - RobotiqGripperPlugin drives the gripper (socket, off the RT loop)
+#
+# Adapt the UR IP, the serial port, and the gripper host to your rig.
+# Task gains/topics live in the controller's own CallmWbcController.yaml.
+# ===========================================================================
+
+MainRobot: UR5eFloatingBase
+Enabled: CallmWbcController
+
+# Controller period. mc_rtde requires Timestep to be an integer multiple of
+# RTDE.RobotTimestep. The multi-robot QP (arm+base+gripper+contacts+collisions)
+# is heavy, so run the controller at 200 Hz over a 1 kHz robot loop.
+Timestep: 0.005
+
+# Feed the UR joint encoders (set by mc_rtde) back into the control robot.
+ObserverPipelines:
+  - name: MainPipeline
+    observers:
+      - type: Encoder
+
+# ---- mc_rtde (Universal Robots) interface ---------------------------------
+RTDE:
+  ControlMode: Position       # CallmWbcController commands the arm by joint position
+  RobotTimestep: 0.001        # UR low-level loop (>= 1 ms)
+  ur5e:                       # must match the arm's robot name in the controller
+    ip: "192.168.1.100"       # <-- set to your UR controller IP
+    driver: "ur_rtde"         # ur_rtde (>=CB3) or ur_modern_driver (<=CB2)
+
+# ---- Global plugins (run in the same loop, I/O off the RT thread) ---------
+Plugins: [TriorbBasePlugin, RobotiqGripperPlugin]
+
+TriorbBasePlugin:
+  port: /dev/ttyACM0
+  baudrate: 115200
+  command_key: "Triorb::cmd_velocity"   # CallmWbcController writes body-frame (vx,vy,wz)
+  command_in_world_frame: false         # controller already exports body frame (on SLAM yaw)
+  robot: ""                             # base state comes from SLAM in the controller,
+  base_sensor: ""                       #   not the plugin's wheel-odometry sensor path
+  reset_origin_on_connect: true
+  with_gui: true
+
+RobotiqGripperPlugin:
+  host: 127.0.0.1             # UR controller running the Robotiq URCap socket
+  port: 63352
+  speed: 255
+  force: 100
+  autoActivate: true
+  autoCalibrate: false

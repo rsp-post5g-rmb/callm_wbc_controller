@@ -5,20 +5,60 @@
 #include <mc_rbdyn/RobotLoader.h>
 
 #include <mc_rtc/gui/ArrayInput.h>
+#include <mc_rtc/gui/ArrayLabel.h>
 #include <mc_rtc/gui/Button.h>
+#include <mc_rtc/gui/NumberSlider.h>
 #include <mc_rtc/gui/Transform.h>
+#include <mc_rtc/logging.h>
 
+#include <Eigen/Geometry>
+
+#include <algorithm>
 #include <cmath>
+#include <map>
+
+std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn::RobotModulePtr rm,
+                                                                       const mc_rtc::Configuration & config)
+{
+  // robot 0: UR5e (the MainRobot, UR5eFloatingBase) ; 1: triorb ; 2: env/ground
+  std::vector<mc_rbdyn::RobotModulePtr> modules;
+  modules.push_back(rm);
+  modules.push_back(mc_rbdyn::RobotLoader::get_robot_module("triorb"));
+  modules.push_back(mc_rbdyn::RobotLoader::get_robot_module("env/ground"));
+
+  // robot 3: Robotiq gripper (optional). It is a ConnectableRobotModule from
+  // mc_robot_tools ("Robotiq2f85Gripper" / "Robotiq2f140Gripper"), loaded here as a
+  // separate robot and bolted onto the UR5e tool in reset(). If the module is not on
+  // the path we log and continue without it rather than aborting construction.
+  bool gripperEnabled = true;
+  std::string gripperModule = "Robotiq2f85Gripper";
+  if(config.has("gripper"))
+  {
+    auto g = config("gripper");
+    g("enable", gripperEnabled);
+    g("model", gripperModule);
+  }
+  if(gripperEnabled)
+  {
+    try
+    {
+      auto gm = mc_rbdyn::RobotLoader::get_robot_module(gripperModule);
+      if(gm) { modules.push_back(gm); }
+      else { mc_rtc::log::warning("[CallmWbcController] Gripper module '{}' not found; running without it", gripperModule); }
+    }
+    catch(const std::exception & e)
+    {
+      mc_rtc::log::warning("[CallmWbcController] Could not load gripper module '{}': {}. Running without it",
+                           gripperModule, e.what());
+    }
+  }
+  return modules;
+}
 
 CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
                                       double dt,
                                       const mc_rtc::Configuration & config)
-// robot 0: UR5e (floating base, from MainRobot: UR5eFloatingBase)
-// robot 1: triorb (the omnidirectional base; fixed root + base_x/base_y/base_yaw joints)
-// robot 2: env/ground (visual reference only)
-: mc_control::MCController({rm, mc_rbdyn::RobotLoader::get_robot_module("triorb"),
-                            mc_rbdyn::RobotLoader::get_robot_module("env/ground")},
-                           dt)
+: mc_control::MCController(robotModules(rm, config), dt)
 {
   // ---- Configurable task gains / weights -----------------------------------
   auto loadGains = [&](const std::string & key, double & stiffness, double & weight)
@@ -34,13 +74,50 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   loadGains("base_task", baseStiffness_, baseWeight_);
   loadGains("ur5e_posture", ur5ePostureStiffness_, ur5ePostureWeight_);
   loadGains("triorb_posture", triorbPostureStiffness_, triorbPostureWeight_);
+  loadGains("gripper_posture", gripperPostureStiffness_, gripperPostureWeight_);
+  if(config.has("base_task")) { config("base_task")("damping", baseDamping_); }
+
+  // ---- Base command routing (velocity is the active path) ------------------
+  if(config.has("base_command")) { config("base_command")("mode", baseCommandMode_); }
+
+  // ---- Gripper naming (derived from the selected model) --------------------
+  if(config.has("gripper"))
+  {
+    auto g = config("gripper");
+    g("model", gripperModule_);
+    g("set_opening_call", gripperSetOpeningCall_);
+  }
+  gripperRobot_ = (gripperModule_.find("140") != std::string::npos) ? "robotiq_2f_140_gripper" : "robotiq_2f_85_gripper";
+  gripperEnabled_ = robots().hasRobot(gripperRobot_);
+
+  // ---- ROS interface options -----------------------------------------------
+  if(config.has("ros"))
+  {
+    auto r = config("ros");
+    r("node_name", rosNodeName_);
+    r("command_topic", commandTopic_);
+    r("measured_topic", measuredTopic_);
+    r("publish_measured", publishMeasured_);
+    r("publish_decimation", publishDecimation_);
+  }
+
+  // ---- Base localization (SLAM) + base-velocity export ---------------------
+  if(config.has("base_state"))
+  {
+    auto b = config("base_state");
+    b("from_slam", baseStateFromSlam_);
+    b("slam_topic", slamTopic_);
+    b("slam_frame", slamFrameMode_); // "capture_offset" or "world"
+    b("slam_timeout", slamTimeout_);
+    b("command_key", triorbCmdKey_);
+  }
 
   // ---- Constraints + main-robot posture ------------------------------------
   solver().addConstraintSet(contactConstraint);
   solver().addConstraintSet(kinematicsConstraint); // UR5e (robot 0) joint limits
   solver().addConstraintSet(selfCollisionConstraint); // UR5e self-collisions
   solver().addTask(postureTask); // UR5e posture (robot 0)
-  solver().setContacts({}); // start with no contacts; the arm<->base contact is added in reset()
+  solver().setContacts({}); // start with no contacts; couplings are added in reset()
 
   // ---- Arm <-> base attachment surface -------------------------------------
   // The TriOrb module ships no RSDF surfaces, so we declare, at runtime, a planar
@@ -52,18 +129,12 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   robot("triorb").addSurface(std::make_shared<mc_rbdyn::PlanarSurface>(
       armMountSurface_, "mount", sva::PTransformd::Identity(), "plastic", mountPoints));
 
-  // Note: no dof-masked base<->ground contact is needed. Unlike Dingo in the
-  // mobile-arm tutorial, the TriOrb module is fixed-base with explicit planar
-  // joints (base_x / base_y / base_yaw), so its planar motion is intrinsic to the
-  // kinematics and is solved directly by the QP through those joints.
-
   // ---- Arm <-> base collision avoidance ------------------------------------
   // mc_rtc auto-builds an sch::S_Box collision convex named "base" for the TriOrb
   // base link directly from the URDF <box> collision primitive, so no extra hull
   // file is needed. We guard the distal arm links against that box. base_link and
   // shoulder_link are intentionally excluded: the arm base is rigidly mounted on
-  // top of the base, so they sit permanently against it by design. (UR5e internal
-  // self-collisions are already covered by selfCollisionConstraint.)
+  // top of the base, so they sit permanently against it by design.
   bool enableArmBaseCollision = true;
   double ciDist = 0.05; // interaction distance: avoidance starts engaging here
   double csDist = 0.02; // safety distance: hard lower bound on separation
@@ -84,8 +155,14 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   }
 
   setupTargetsIO();
+  setupRos();
 
-  mc_rtc::log::success("CallmWbcController init done");
+  mc_rtc::log::success("CallmWbcController init done (gripper: {})", gripperEnabled_ ? gripperRobot_ : "disabled");
+}
+
+CallmWbcController::~CallmWbcController()
+{
+  stopRos();
 }
 
 void CallmWbcController::setupTargetsIO()
@@ -93,11 +170,15 @@ void CallmWbcController::setupTargetsIO()
   if(ioReady_) { return; }
   ioReady_ = true;
 
-  // Datastore is the single source of truth for the commanded targets. The GUI
-  // reads/writes these keys, and an external commander can assign() them live.
+  // Datastore is the single source of truth for the commanded targets. The GUI and
+  // the ROS handler (via applyPendingCommand) read/write these keys; run() then pushes
+  // them onto the live tasks.
   datastore().make<sva::PTransformd>(EE_TARGET_KEY, sva::PTransformd::Identity());
-  datastore().make<sva::PTransformd>(BASE_TARGET_KEY,
-                                     sva::PTransformd(Eigen::Vector3d(0.0, 0.0, baseHeight_)));
+  datastore().make<sva::PTransformd>(BASE_TARGET_KEY, sva::PTransformd(Eigen::Vector3d(0.0, 0.0, baseHeight_)));
+  datastore().make<Eigen::Vector3d>(BASE_VELOCITY_KEY, Eigen::Vector3d::Zero());
+  datastore().make<std::vector<double>>(ARM_POSTURE_KEY, std::vector<double>(armJointNames_.size(), 0.0));
+  datastore().make<std::vector<double>>(BASE_POSTURE_KEY, std::vector<double>(baseJointNames_.size(), 0.0));
+  datastore().make<double>(GRIPPER_OPENING_KEY, 0.0);
 
   gui()->addElement(
       {"CallmWbc"},
@@ -105,29 +186,31 @@ void CallmWbcController::setupTargetsIO()
           "EE target [world]", [this]() -> sva::PTransformd
           { return datastore().get<sva::PTransformd>(EE_TARGET_KEY); },
           [this](const sva::PTransformd & p) { datastore().assign<sva::PTransformd>(EE_TARGET_KEY, p); }),
+      mc_rtc::gui::ArrayInput(
+          "Base velocity [vx, vy, wyaw] (body)", {"vx", "vy", "wyaw"},
+          [this]() -> Eigen::Vector3d { return datastore().get<Eigen::Vector3d>(BASE_VELOCITY_KEY); },
+          [this](const Eigen::Vector3d & v) { datastore().assign<Eigen::Vector3d>(BASE_VELOCITY_KEY, v); }),
+      mc_rtc::gui::ArrayInput(
+          "Arm posture [rad]", armJointNames_,
+          [this]() -> std::vector<double> { return datastore().get<std::vector<double>>(ARM_POSTURE_KEY); },
+          [this](const std::vector<double> & q) { datastore().assign<std::vector<double>>(ARM_POSTURE_KEY, q); }),
+      mc_rtc::gui::NumberSlider(
+          "Gripper opening (0=open, 1=closed)", [this]() { return datastore().get<double>(GRIPPER_OPENING_KEY); },
+          [this](double v) { datastore().assign<double>(GRIPPER_OPENING_KEY, std::max(0.0, std::min(1.0, v))); }, 0.0,
+          1.0));
+
+  // Inactive/overridable base-pose command path (used only when base_command.mode = "pose").
+  gui()->addElement(
+      {"CallmWbc", "Base pose (inactive path)"},
       mc_rtc::gui::Transform(
           "Base target [world]", [this]() -> sva::PTransformd
           { return datastore().get<sva::PTransformd>(BASE_TARGET_KEY); },
           [this](const sva::PTransformd & p) { datastore().assign<sva::PTransformd>(BASE_TARGET_KEY, p); }),
-      mc_rtc::gui::ArrayInput(
-          "Base target [x, y, yaw]", {"x", "y", "yaw"},
-          [this]() -> Eigen::Vector3d
-          {
-            const auto & X = datastore().get<sva::PTransformd>(BASE_TARGET_KEY);
-            const auto & R = X.rotation();
-            return {X.translation().x(), X.translation().y(), std::atan2(R(0, 1), R(0, 0))};
-          },
-          [this](const Eigen::Vector3d & xyyaw)
-          {
-            datastore().assign<sva::PTransformd>(
-                BASE_TARGET_KEY,
-                sva::PTransformd(sva::RotZ(xyyaw.z()), Eigen::Vector3d(xyyaw.x(), xyyaw.y(), baseHeight_)));
-          }),
       mc_rtc::gui::Button("Sync targets to current robot",
                           [this]()
                           {
                             datastore().assign<sva::PTransformd>(EE_TARGET_KEY,
-                                                                 robots().robot(0).surfacePose("Tool"));
+                                                                 robots().robot("ur5e").surfacePose("Tool"));
                             datastore().assign<sva::PTransformd>(BASE_TARGET_KEY,
                                                                  robots().robot("triorb").bodyPosW("base"));
                           }));
@@ -135,17 +218,183 @@ void CallmWbcController::setupTargetsIO()
 
 bool CallmWbcController::run()
 {
-  // Pull the commanded targets and step the QP. Nothing else belongs here.
+  applyBaseState(); // SLAM pose -> TriOrb base joints (measured state, before the QP)
+  applyPendingCommand(); // ROS-buffered command -> datastore (control thread)
+  applyCommandsToTasks(); // datastore -> live tasks / gripper
+  bool ok = mc_control::MCController::run(); // QP solves + euler-integrates
+  exportBaseVelocity(); // QP-realized base velocity (body frame) -> TriorbBasePlugin
+  if(publishMeasured_ && measuredPublisher_ && (runCounter_ % publishDecimation_ == 0)) { publishMeasured(); }
+  ++runCounter_;
+  return ok;
+}
+
+void CallmWbcController::applyPendingCommand()
+{
+  WbcData cmd;
+  {
+    // try_lock: never block the (possibly SCHED_DEADLINE) control loop on the ROS
+    // spin thread. If the callback holds the lock this tick, the command stays
+    // pending and is applied next tick (latest-wins, one-tick latency is fine).
+    std::unique_lock<std::mutex> lock(commandMutex_, std::try_to_lock);
+    if(!lock.owns_lock() || !hasPendingCommand_) { return; }
+    cmd = commandedData_;
+    hasPendingCommand_ = false;
+  }
+
+  // Arm end-effector SE3 target (world). The wire quaternion is the SVA-frame
+  // rotation, matching the reference explicit_compliance_controller round-trip.
+  Eigen::Quaterniond q(cmd.eef_quat[0], cmd.eef_quat[1], cmd.eef_quat[2], cmd.eef_quat[3]);
+  if(q.norm() < 1e-9) { q = Eigen::Quaterniond::Identity(); }
+  q.normalize();
+  sva::PTransformd eePose(q.toRotationMatrix(),
+                          Eigen::Vector3d(cmd.eef_pos[0], cmd.eef_pos[1], cmd.eef_pos[2]));
+  datastore().assign<sva::PTransformd>(EE_TARGET_KEY, eePose);
+
+  datastore().assign<std::vector<double>>(ARM_POSTURE_KEY,
+                                          std::vector<double>(cmd.posture_arm.begin(), cmd.posture_arm.end()));
+  // posture_base: plumbed only (single extension point) -- stored, not actuated.
+  datastore().assign<std::vector<double>>(BASE_POSTURE_KEY,
+                                          std::vector<double>(cmd.posture_base.begin(), cmd.posture_base.end()));
+  datastore().assign<Eigen::Vector3d>(
+      BASE_VELOCITY_KEY, Eigen::Vector3d(cmd.velocity_base[0], cmd.velocity_base[1], cmd.velocity_base[2]));
+  datastore().assign<double>(GRIPPER_OPENING_KEY, cmd.gripper_opening);
+}
+
+void CallmWbcController::applyCommandsToTasks()
+{
+  // Arm end-effector (active).
   if(eeTask_) { eeTask_->target(datastore().get<sva::PTransformd>(EE_TARGET_KEY)); }
-  if(baseTask_) { baseTask_->target(datastore().get<sva::PTransformd>(BASE_TARGET_KEY)); }
-  return mc_control::MCController::run();
+
+  // Arm posture (active).
+  if(postureTask)
+  {
+    const auto & arm = datastore().get<std::vector<double>>(ARM_POSTURE_KEY);
+    std::map<std::string, std::vector<double>> target;
+    for(size_t i = 0; i < armJointNames_.size() && i < arm.size(); ++i) { target[armJointNames_[i]] = {arm[i]}; }
+    postureTask->target(target);
+  }
+
+  // Base command: exactly one path drives the base transform task.
+  if(baseTask_)
+  {
+    if(baseCommandMode_ == "velocity")
+    {
+      integrateBaseVelocity(); // active: velocity_base integrated into the base target
+    }
+    else
+    {
+      // inactive/overridable path: command the base by an absolute pose.
+      baseTask_->target(datastore().get<sva::PTransformd>(BASE_TARGET_KEY));
+      baseTask_->refVelB(sva::MotionVecd(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()));
+    }
+  }
+
+  // Gripper (active): forward to the mc_robotiq plugin if it is loaded.
+  if(gripperEnabled_ && datastore().has(gripperSetOpeningCall_))
+  {
+    double opening = datastore().get<double>(GRIPPER_OPENING_KEY);
+    datastore().call(gripperSetOpeningCall_, opening);
+  }
+}
+
+void CallmWbcController::integrateBaseVelocity()
+{
+  const auto vel = datastore().get<Eigen::Vector3d>(BASE_VELOCITY_KEY); // (vx, vy, wyaw) in the base body frame
+  const auto & R = baseTargetPose_.rotation();
+  double yaw = std::atan2(R(0, 1), R(0, 0)); // SVA RotZ convention, matches setupTargetsIO
+  const double c = std::cos(yaw), s = std::sin(yaw);
+  const double vx = vel.x(), vy = vel.y(), wz = vel.z();
+  const double dt = solver().dt();
+
+  Eigen::Vector3d t = baseTargetPose_.translation();
+  t.x() += (c * vx - s * vy) * dt; // body -> world
+  t.y() += (s * vx + c * vy) * dt;
+  yaw += wz * dt;
+  baseTargetPose_ = sva::PTransformd(sva::RotZ(yaw), t);
+
+  baseTask_->target(baseTargetPose_);
+  // Feed-forward the commanded body velocity so the QP tracks it smoothly.
+  baseTask_->refVelB(sva::MotionVecd(Eigen::Vector3d(0.0, 0.0, wz), Eigen::Vector3d(vx, vy, 0.0)));
+}
+
+void CallmWbcController::applyBaseState()
+{
+  if(!baseStateFromSlam_) { return; }
+
+  SlamPose p;
+  {
+    // try_lock: don't stall the control loop on the ROS spin thread.
+    std::unique_lock<std::mutex> lock(slamMutex_, std::try_to_lock);
+    if(!lock.owns_lock()) { return; }
+    p = slamPose_;
+  }
+  if(!p.valid) { return; } // no localization yet -> leave the base model as-is
+
+  // Staleness: hold the last pose but warn once if SLAM has gone quiet.
+  const double age = std::chrono::duration<double>(std::chrono::steady_clock::now() - p.recv).count();
+  if(age > slamTimeout_)
+  {
+    if(!slamStaleWarned_)
+    {
+      mc_rtc::log::warning("[CallmWbcController] SLAM pose stale ({:.2f}s > {:.2f}s); holding last base pose", age,
+                           slamTimeout_);
+      slamStaleWarned_ = true;
+    }
+  }
+  else
+  {
+    slamStaleWarned_ = false;
+  }
+
+  // Express the SLAM pose in the controller world frame.
+  double wx = p.x, wy = p.y, wyaw = p.yaw;
+  if(slamFrameMode_ != "world")
+  {
+    // capture-offset: world = R(-offYaw) * (slam - off), offset grabbed once at reset.
+    if(!slamOffsetCaptured_)
+    {
+      slamOffX_ = p.x;
+      slamOffY_ = p.y;
+      slamOffYaw_ = p.yaw;
+      slamOffsetCaptured_ = true;
+    }
+    const double dx = p.x - slamOffX_, dy = p.y - slamOffY_;
+    const double c = std::cos(slamOffYaw_), s = std::sin(slamOffYaw_);
+    wx = c * dx + s * dy;
+    wy = -s * dx + c * dy;
+    wyaw = std::atan2(std::sin(p.yaw - slamOffYaw_), std::cos(p.yaw - slamOffYaw_)); // wrapped
+  }
+
+  // Overwrite the planar base joints with the measured pose, then refresh FK/velocity.
+  auto & tri = robots().robot("triorb");
+  tri.mbc().q[tri.jointIndexByName("base_x")] = {wx};
+  tri.mbc().q[tri.jointIndexByName("base_y")] = {wy};
+  tri.mbc().q[tri.jointIndexByName("base_yaw")] = {wyaw};
+  tri.forwardKinematics();
+  tri.forwardVelocity();
+}
+
+void CallmWbcController::exportBaseVelocity()
+{
+  // Only active when the TriorbBasePlugin is loaded (it registers this key).
+  if(!datastore().has(triorbCmdKey_)) { return; }
+
+  auto & tri = robots().robot("triorb");
+  const double xd = tri.mbc().alpha[tri.jointIndexByName("base_x")][0]; // world-frame ẋ
+  const double yd = tri.mbc().alpha[tri.jointIndexByName("base_y")][0]; // world-frame ẏ
+  const double wz = tri.mbc().alpha[tri.jointIndexByName("base_yaw")][0]; // θ̇
+  const double yaw = tri.mbc().q[tri.jointIndexByName("base_yaw")][0]; // == SLAM yaw (grounded above)
+  const double c = std::cos(yaw), s = std::sin(yaw);
+  // world -> body; the plugin is configured with command_in_world_frame: false.
+  const Eigen::Vector3d body(c * xd + s * yd, -s * xd + c * yd, wz);
+  datastore().assign<Eigen::Vector3d>(triorbCmdKey_, body);
 }
 
 void CallmWbcController::reset(const mc_control::ControllerResetData & reset_data)
 {
   mc_control::MCController::reset(reset_data);
 
-  // 1. Initial poses, set BEFORE the coupling contact is added. The TriOrb root
+  // 1. Initial poses, set BEFORE the coupling contacts are added. The TriOrb root
   // (`world`) stays at the origin; the base is carried by its base_x/base_y/base_yaw
   // joints. The arm's floating base is placed onto the mount link so that the UR5e
   // "Base" surface coincides with the runtime-added "ArmMount" surface.
@@ -153,8 +402,7 @@ void CallmWbcController::reset(const mc_control::ControllerResetData & reset_dat
   robots().robot(0).posW(sva::PTransformd(sva::RotZ(0.0), Eigen::Vector3d(0.0, 0.0, mountHeight_)));
 
   // 2. Rigid arm<->base attachment (all 6 dof constrained). Added AFTER posW so the
-  // contact frame captures the intended relative pose (see the ordering note in the
-  // mobile-arm tutorial).
+  // contact frame captures the intended relative pose.
   addContact({"triorb", "ur5e", armMountSurface_, "Base"});
 
   // 3. WBC tasks.
@@ -164,27 +412,194 @@ void CallmWbcController::reset(const mc_control::ControllerResetData & reset_dat
 
   baseTask_ = std::make_shared<mc_tasks::TransformTask>("base", robots(), 1, baseStiffness_, baseWeight_);
   baseTask_->reset(); // target := current base pose
+  if(baseDamping_ >= 0.0) { baseTask_->setGains(baseStiffness_, baseDamping_); }
   solver().addTask(baseTask_);
+  baseTargetPose_ = baseTask_->target();
 
-  // Per-robot constraint + light posture for the base (mirrors the articulated-object
-  // handling in the mobile-arm tutorial).
+  // Per-robot constraint + light posture for the base (regularizes base_x/base_y/base_yaw).
   triorbKinematics_ = std::make_unique<mc_solver::KinematicsConstraint>(robots(), 1, solver().dt());
   solver().addConstraintSet(triorbKinematics_);
   triorbPostureTask_ =
       std::make_shared<mc_tasks::PostureTask>(solver(), 1, triorbPostureStiffness_, triorbPostureWeight_);
   solver().addTask(triorbPostureTask_);
 
-  // UR5e standby posture to resolve arm redundancy in the null space of the EE task.
+  // 4. Robotiq gripper: bolt it onto the UR5e tool and regularize its knuckle joints.
+  if(gripperEnabled_ && robots().hasRobot(gripperRobot_))
+  {
+    const unsigned int gi = robots().robot(gripperRobot_).robotIndex();
+    // Place the gripper base at the tool with the module's default mounting transform
+    // (RobotiqGripperRobotModule::defaultMountingTransform() == RotZ(pi)), then freeze
+    // the attachment with a rigid Tool<->Base contact.
+    const sva::PTransformd toolPose = robots().robot("ur5e").surfacePose("Tool");
+    const sva::PTransformd mount(sva::RotZ(M_PI));
+    robots().robot(gripperRobot_).posW(mount * toolPose);
+    addContact({"ur5e", gripperRobot_, "Tool", gripperBaseSurface_});
+
+    gripperKinematics_ = std::make_unique<mc_solver::KinematicsConstraint>(robots(), gi, solver().dt());
+    solver().addConstraintSet(gripperKinematics_);
+    gripperPostureTask_ =
+        std::make_shared<mc_tasks::PostureTask>(solver(), gi, gripperPostureStiffness_, gripperPostureWeight_);
+    solver().addTask(gripperPostureTask_);
+  }
+
+  // 5. UR5e standby posture (resolves arm redundancy in the null space of the EE task).
   postureTask->stiffness(ur5ePostureStiffness_);
   postureTask->weight(ur5ePostureWeight_);
-  postureTask->target({{"shoulder_lift_joint", {-M_PI / 2}}, {"elbow_joint", {M_PI / 2}}});
+  const std::vector<double> armStandby = {0.0, -M_PI / 2, M_PI / 2, 0.0, 0.0, 0.0};
 
-  // 4. Seed the commanded targets with the current task targets so the robot holds
-  // still until a commander (GUI / datastore) moves them.
+  // 6. Seed the commanded targets so the robot holds still until a commander moves them.
   datastore().assign<sva::PTransformd>(EE_TARGET_KEY, eeTask_->target());
   datastore().assign<sva::PTransformd>(BASE_TARGET_KEY, baseTask_->target());
+  datastore().assign<Eigen::Vector3d>(BASE_VELOCITY_KEY, Eigen::Vector3d::Zero());
+  datastore().assign<std::vector<double>>(ARM_POSTURE_KEY, armStandby);
+  datastore().assign<std::vector<double>>(BASE_POSTURE_KEY, std::vector<double>(baseJointNames_.size(), 0.0));
+  datastore().assign<double>(GRIPPER_OPENING_KEY, 0.0);
+
+  // Push the seeds onto the freshly created tasks once, so the first run() is consistent.
+  applyCommandsToTasks();
+
+  // Re-capture the SLAM->world offset at the start of each episode (the base is at
+  // the world origin here, so the first *post-reset* SLAM pose defines the alignment).
+  slamOffsetCaptured_ = false;
+  slamStaleWarned_ = false;
+  {
+    std::lock_guard<std::mutex> lk(slamMutex_);
+    slamPose_.valid = false; // discard any pre-reset pose; wait for a fresh one
+  }
 
   mc_rtc::log::success("CallmWbcController reset done");
+}
+
+// ---------------------------------------------------------------------------
+// ROS2 interface (own context + single-threaded executor on a spin thread).
+// Mirrors explicit_compliance_controller so commands never touch mc_rtc objects
+// off the control loop: the callback only fills a mutex-guarded WbcData buffer.
+// ---------------------------------------------------------------------------
+void CallmWbcController::setupRos()
+{
+  rosContext_ = std::make_shared<rclcpp::Context>();
+  rosContext_->init(0, nullptr);
+
+  rclcpp::NodeOptions options;
+  options.context(rosContext_);
+  rosNode_ = std::make_shared<rclcpp::Node>(rosNodeName_, options);
+  rosCallbackGroup_ = rosNode_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  rclcpp::SubscriptionOptions sub_options;
+  sub_options.callback_group = rosCallbackGroup_;
+  commandSubscriber_ = rosNode_->create_subscription<std_msgs::msg::Float64MultiArray>(
+      commandTopic_, rclcpp::QoS(1),
+      [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) { handleCommand(msg); }, sub_options);
+
+  if(baseStateFromSlam_)
+  {
+    slamSubscriber_ = rosNode_->create_subscription<geometry_msgs::msg::PoseStamped>(
+        slamTopic_, rclcpp::QoS(1),
+        [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) { handleSlamPose(msg); }, sub_options);
+    mc_rtc::log::info("[CallmWbcController] base state from SLAM topic '{}' (frame: {})", slamTopic_, slamFrameMode_);
+  }
+
+  if(publishMeasured_)
+  {
+    measuredPublisher_ = rosNode_->create_publisher<std_msgs::msg::Float64MultiArray>(measuredTopic_, rclcpp::QoS(1));
+  }
+
+  rclcpp::ExecutorOptions executor_options;
+  executor_options.context = rosContext_;
+  rosExecutor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>(executor_options);
+  rosExecutor_->add_node(rosNode_);
+  rosSpinThread_ = std::thread([this]() { rosExecutor_->spin(); });
+
+  mc_rtc::log::info("[CallmWbcController] ROS node '{}' listening on '{}'", rosNodeName_, commandTopic_);
+}
+
+void CallmWbcController::stopRos()
+{
+  if(rosExecutor_) { rosExecutor_->cancel(); }
+  if(rosSpinThread_.joinable()) { rosSpinThread_.join(); }
+  if(rosNode_ && rosExecutor_) { rosExecutor_->remove_node(rosNode_); }
+  commandSubscriber_.reset();
+  slamSubscriber_.reset();
+  measuredPublisher_.reset();
+  rosNode_.reset();
+  rosExecutor_.reset();
+  rosCallbackGroup_.reset();
+  if(rosContext_)
+  {
+    rosContext_->shutdown("CallmWbcController shutdown");
+    rosContext_.reset();
+  }
+}
+
+void CallmWbcController::handleCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+{
+  WbcData unpacked;
+  if(!WbcData::unpack(msg->data, unpacked))
+  {
+    mc_rtc::log::warning("[CallmWbcController] {} size mismatch: expected {}, got {}", commandTopic_, WbcData::SIZE,
+                         msg->data.size());
+    return;
+  }
+  std::lock_guard<std::mutex> lock(commandMutex_);
+  commandedData_ = unpacked;
+  hasPendingCommand_ = true;
+}
+
+void CallmWbcController::handleSlamPose(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+{
+  // Planar projection: keep x, y and yaw; drop z / roll / pitch. The orientation is
+  // the base heading in the SLAM map frame (standard ROS active convention).
+  const Eigen::Quaterniond q(msg->pose.orientation.w, msg->pose.orientation.x, msg->pose.orientation.y,
+                             msg->pose.orientation.z);
+  const Eigen::Matrix3d R = q.normalized().toRotationMatrix();
+  const double yaw = std::atan2(R(1, 0), R(0, 0));
+
+  std::lock_guard<std::mutex> lock(slamMutex_);
+  slamPose_.x = msg->pose.position.x;
+  slamPose_.y = msg->pose.position.y;
+  slamPose_.yaw = yaw;
+  slamPose_.recv = std::chrono::steady_clock::now();
+  slamPose_.valid = true;
+}
+
+WbcData CallmWbcController::collectMeasured() const
+{
+  WbcData m;
+  const auto & ur5e = robots().robot("ur5e");
+  const sva::PTransformd toolPose = ur5e.surfacePose("Tool");
+  const Eigen::Quaterniond quat(toolPose.rotation());
+  m.eef_pos = {toolPose.translation().x(), toolPose.translation().y(), toolPose.translation().z()};
+  m.eef_quat = {quat.w(), quat.x(), quat.y(), quat.z()};
+  for(size_t i = 0; i < armJointNames_.size(); ++i)
+  {
+    m.posture_arm[i] = ur5e.mbc().q[ur5e.jointIndexByName(armJointNames_[i])][0];
+  }
+
+  const auto & tri = robots().robot("triorb");
+  for(size_t i = 0; i < baseJointNames_.size(); ++i)
+  {
+    m.posture_base[i] = tri.mbc().q[tri.jointIndexByName(baseJointNames_[i])][0];
+  }
+  // Base body velocity from the integrated base joint velocities (world -> body).
+  const double xd = tri.mbc().alpha[tri.jointIndexByName("base_x")][0];
+  const double yd = tri.mbc().alpha[tri.jointIndexByName("base_y")][0];
+  const double thd = tri.mbc().alpha[tri.jointIndexByName("base_yaw")][0];
+  const double yaw = m.posture_base[2];
+  const double c = std::cos(yaw), s = std::sin(yaw);
+  m.velocity_base = {c * xd + s * yd, -s * xd + c * yd, thd};
+
+  if(datastore().has("RobotiqGripper::opening"))
+  {
+    m.gripper_opening = datastore().call<double>("RobotiqGripper::opening");
+  }
+  return m;
+}
+
+void CallmWbcController::publishMeasured()
+{
+  std_msgs::msg::Float64MultiArray msg;
+  msg.data = collectMeasured().pack();
+  measuredPublisher_->publish(msg);
 }
 
 CONTROLLER_CONSTRUCTOR("CallmWbcController", CallmWbcController)

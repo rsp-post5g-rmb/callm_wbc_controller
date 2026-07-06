@@ -1,8 +1,21 @@
 # This configuration is used to run a few iterations of the controller as a smoke
-# test. It requires the UR5e and TriOrb robot modules to be available on the module
-# path (they are, when built inside mc_rtc_superbuild).
+# test. It requires the UR5e, TriOrb and Robotiq gripper robot modules to be on the
+# module path (they are, when built inside mc_rtc_superbuild).
 MainRobot: UR5eFloatingBase
 Enabled: CallmWbcController
 
 ClearControllerModulePath: true
 ControllerModulePaths: ["$<TARGET_FILE_DIR:CallmWbcController>"]
+
+# The Robotiq gripper command path goes through the mc_robotiq GlobalPlugin, which
+# exposes the `RobotiqGripper::setOpening` datastore call. With no gripper hardware
+# reachable the plugin's worker thread just retries the socket in the background
+# (harmless for the smoke test); the datastore call is registered regardless.
+Plugins: [RobotiqGripperPlugin]
+RobotiqGripperPlugin:
+  host: 127.0.0.1
+  port: 63352
+  speed: 255
+  force: 100
+  autoActivate: true
+  autoCalibrate: false
