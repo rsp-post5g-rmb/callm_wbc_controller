@@ -700,14 +700,14 @@ WbcData CallmWbcController::collectMeasured() const
   }
 
   // Echo the currently-active per-task gains so the client can read back its mode.
-  const auto & w = datastore().get<std::vector<double>>(TASK_WEIGHTS_KEY);
-  const auto & s = datastore().get<std::vector<double>>(TASK_STIFFNESS_KEY);
-  const auto & zeta = datastore().get<std::vector<double>>(TASK_DAMPING_KEY);
+  const auto & wVec = datastore().get<std::vector<double>>(TASK_WEIGHTS_KEY);
+  const auto & sVec = datastore().get<std::vector<double>>(TASK_STIFFNESS_KEY);
+  const auto & zVec = datastore().get<std::vector<double>>(TASK_DAMPING_KEY);
   for(std::size_t i = 0; i < m.task_weights.size(); ++i)
   {
-    if(i < w.size()) { m.task_weights[i] = w[i]; }
-    if(i < s.size()) { m.task_stiffness[i] = s[i]; }
-    if(i < zeta.size()) { m.task_damping_ratio[i] = zeta[i]; }
+    if(i < wVec.size()) { m.task_weights[i] = wVec[i]; }
+    if(i < sVec.size()) { m.task_stiffness[i] = sVec[i]; }
+    if(i < zVec.size()) { m.task_damping_ratio[i] = zVec[i]; }
   }
   return m;
 }
