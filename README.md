@@ -60,17 +60,40 @@ Tasks / constraints
 Command contract (WbcData)
 --
 
-A single flat `std_msgs/Float64MultiArray` (20 doubles, layout in `src/WbcData.h`)
-carries all six fields every message:
+A single flat `std_msgs/Float64MultiArray` (32 doubles, layout in `src/WbcData.h`)
+carries all fields every message:
 
 | Field | Size | Active? | Destination |
 | --- | --- | --- | --- |
 | `eef_pos` | 3 | yes | arm EE `SurfaceTransformTask` target (position) |
 | `eef_quat` | 4 (w,x,y,z) | yes | arm EE `SurfaceTransformTask` target (orientation) |
 | `posture_arm` | 6 | yes | arm `PostureTask` target |
-| `posture_base` | 3 | **plumbed only** | stored in datastore, not actuated (extension point) |
+| `posture_base` | 3 | yes | TriOrb `PostureTask` target (joint-space base command) |
 | `gripper_opening` | 1 | yes | `RobotiqGripper::setOpening` (0 = open, 1 = closed) |
 | `velocity_base` | 3 (vx,vy,wyaw) | yes | base body velocity |
+| `task_weights` | 4 | yes | per-task QP weight — **selects the "mode"** |
+| `task_stiffness` | 4 | yes | per-task tracking gain — **compliance** |
+| `task_damping_ratio` | 4 | yes | per-task ζ (`damping = 2ζ√stiffness`, ζ=1 critical) |
+
+The three gain vectors are ordered **`[ee, posture_arm, base, base_posture]`**.
+
+**Modes are gains, chosen by the client.** The controller is a generic weighted-QP
+executor: it never switches modes itself, it just applies whatever gains arrive (a
+value `< 0` keeps the current/YAML-default value; `>= 0` is adopted, weights/stiffness
+clamped `>= 0`). So the client picks behaviour by weighting tasks:
+
+- **arm**: high `w_ee` = Cartesian (posture regularizes); high `w_posture_arm` with
+  `w_ee = 0` = joint-space (`posture_arm` drives the joints).
+- **base**: high `w_base` = velocity-driven (from `velocity_base`); high `w_base_posture`
+  with `w_base = 0` = joint-space (`posture_base` drives `base_x/base_y/base_yaw`).
+- **compliance**: lower `task_stiffness` for a soft/springy task; `task_damping_ratio`
+  shapes overshoot (ζ = 1 critical; only lower it deliberately).
+
+Presets (`se3`, `direct`, `joint`, `compliant`) live in the Python client
+(`scripts/callm_wbc_client.py`, `MODE_PRESETS` / `WbcData.set_mode()`); the active
+gains are echoed back on the measured topic. A degenerate weight set that leaves the
+arm (`w_ee + w_posture_arm`) or the base (`w_base + w_base_posture`) with no authority
+is rejected and the previous weights kept.
 
 Base command: **velocity is the active path.** `velocity_base` (body frame) is
 integrated into the `TransformTask` target each control step, with a body-velocity

@@ -29,14 +29,11 @@ ur5e_posture:
   stiffness: 10.0
   weight: 5.0
 
-# Base command task (robot 1). Drives base_x / base_y / base_yaw. In the active
-# config the base is commanded by velocity_base (integrated into this task's target
-# with a body-velocity feed-forward). `damping` is optional: mc_rtc has NO generic
-# "damping task" (mc_tasks::force::DampingTask is an admittance/force task needing a
-# force sensor), so base damping is just this trajectory task's damping coefficient.
-# Leave it commented to use the default (2*sqrt(stiffness)).
-# base_task:
-#   damping: 4.0
+# NOTE on damping: task damping is seeded critical (2*sqrt(stiffness)) for every task.
+# There is no per-task YAML damping knob -- shape damping at runtime, per task, via the
+# WbcData `task_damping_ratio` field (zeta; damping = 2*zeta*sqrt(stiffness), zeta=1 =
+# critical). mc_rtc has no generic "damping task" (mc_tasks::force::DampingTask is an
+# admittance/force task needing a force sensor).
 
 # How the base is driven: "velocity" (active -- from velocity_base) or "pose"
 # (inactive/overridable -- from the Base target [world] GUI marker / BASE_TARGET_KEY).

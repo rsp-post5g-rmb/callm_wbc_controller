@@ -17,6 +17,16 @@
 #include <cmath>
 #include <map>
 
+namespace
+{
+/** Clamp every element to >= 0 (weights/stiffness/damping-ratio are non-negative). */
+std::vector<double> clampNonNeg(std::vector<double> v)
+{
+  for(auto & x : v) { x = std::max(0.0, x); }
+  return v;
+}
+} // namespace
+
 std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn::RobotModulePtr rm,
                                                                        const mc_rtc::Configuration & config)
 {
@@ -75,7 +85,6 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   loadGains("ur5e_posture", ur5ePostureStiffness_, ur5ePostureWeight_);
   loadGains("triorb_posture", triorbPostureStiffness_, triorbPostureWeight_);
   loadGains("gripper_posture", gripperPostureStiffness_, gripperPostureWeight_);
-  if(config.has("base_task")) { config("base_task")("damping", baseDamping_); }
 
   // ---- Base command routing (velocity is the active path) ------------------
   if(config.has("base_command")) { config("base_command")("mode", baseCommandMode_); }
@@ -179,6 +188,16 @@ void CallmWbcController::setupTargetsIO()
   datastore().make<std::vector<double>>(ARM_POSTURE_KEY, std::vector<double>(armJointNames_.size(), 0.0));
   datastore().make<std::vector<double>>(BASE_POSTURE_KEY, std::vector<double>(baseJointNames_.size(), 0.0));
   datastore().make<double>(GRIPPER_OPENING_KEY, 0.0);
+  // Per-task gains, order [ee, posture_arm, base, base_posture], seeded from the YAML
+  // defaults (damping ratio = 1 => critically damped). A client picks a "mode" via the
+  // weights and shapes compliance via stiffness/damping. See applyPendingCommand for
+  // the <0 = keep-default sentinel.
+  datastore().make<std::vector<double>>(
+      TASK_WEIGHTS_KEY, std::vector<double>{eeWeight_, ur5ePostureWeight_, baseWeight_, triorbPostureWeight_});
+  datastore().make<std::vector<double>>(
+      TASK_STIFFNESS_KEY,
+      std::vector<double>{eeStiffness_, ur5ePostureStiffness_, baseStiffness_, triorbPostureStiffness_});
+  datastore().make<std::vector<double>>(TASK_DAMPING_KEY, std::vector<double>{1.0, 1.0, 1.0, 1.0});
 
   gui()->addElement(
       {"CallmWbc"},
@@ -197,7 +216,22 @@ void CallmWbcController::setupTargetsIO()
       mc_rtc::gui::NumberSlider(
           "Gripper opening (0=open, 1=closed)", [this]() { return datastore().get<double>(GRIPPER_OPENING_KEY); },
           [this](double v) { datastore().assign<double>(GRIPPER_OPENING_KEY, std::max(0.0, std::min(1.0, v))); }, 0.0,
-          1.0));
+          1.0),
+      mc_rtc::gui::ArrayInput(
+          "Task weights [ee, arm, base, base_post]", {"ee", "arm", "base", "base_post"},
+          [this]() -> std::vector<double> { return datastore().get<std::vector<double>>(TASK_WEIGHTS_KEY); },
+          [this](const std::vector<double> & v)
+          { datastore().assign<std::vector<double>>(TASK_WEIGHTS_KEY, clampNonNeg(v)); }),
+      mc_rtc::gui::ArrayInput(
+          "Task stiffness [ee, arm, base, base_post]", {"ee", "arm", "base", "base_post"},
+          [this]() -> std::vector<double> { return datastore().get<std::vector<double>>(TASK_STIFFNESS_KEY); },
+          [this](const std::vector<double> & v)
+          { datastore().assign<std::vector<double>>(TASK_STIFFNESS_KEY, clampNonNeg(v)); }),
+      mc_rtc::gui::ArrayInput(
+          "Task damping ratio [ee, arm, base, base_post]", {"ee", "arm", "base", "base_post"},
+          [this]() -> std::vector<double> { return datastore().get<std::vector<double>>(TASK_DAMPING_KEY); },
+          [this](const std::vector<double> & v)
+          { datastore().assign<std::vector<double>>(TASK_DAMPING_KEY, clampNonNeg(v)); }));
 
   // Inactive/overridable base-pose command path (used only when base_command.mode = "pose").
   gui()->addElement(
@@ -252,16 +286,66 @@ void CallmWbcController::applyPendingCommand()
 
   datastore().assign<std::vector<double>>(ARM_POSTURE_KEY,
                                           std::vector<double>(cmd.posture_arm.begin(), cmd.posture_arm.end()));
-  // posture_base: plumbed only (single extension point) -- stored, not actuated.
+  // posture_base drives the TriOrb PostureTask (joint-space base command); whether it
+  // takes effect is governed by its weight (w_base_posture) in applyCommandsToTasks.
   datastore().assign<std::vector<double>>(BASE_POSTURE_KEY,
                                           std::vector<double>(cmd.posture_base.begin(), cmd.posture_base.end()));
   datastore().assign<Eigen::Vector3d>(
       BASE_VELOCITY_KEY, Eigen::Vector3d(cmd.velocity_base[0], cmd.velocity_base[1], cmd.velocity_base[2]));
   datastore().assign<double>(GRIPPER_OPENING_KEY, cmd.gripper_opening);
+
+  // Per-task gains (mode + compliance), order [ee, posture_arm, base, base_posture].
+  // Sentinel: a value < 0 keeps the current gain; >= 0 is adopted. Resolve against the
+  // currently-stored gains so a partial command only touches what it sets.
+  auto resolve = [&](const char * key, const std::array<double, 4> & incoming)
+  {
+    std::vector<double> cur = datastore().get<std::vector<double>>(key);
+    for(int i = 0; i < 4; ++i)
+    {
+      const double v = incoming[static_cast<std::size_t>(i)];
+      if(v >= 0.0) { cur[static_cast<std::size_t>(i)] = v; }
+    }
+    return cur;
+  };
+  const std::vector<double> w = resolve(TASK_WEIGHTS_KEY, cmd.task_weights);
+  datastore().assign<std::vector<double>>(TASK_STIFFNESS_KEY, resolve(TASK_STIFFNESS_KEY, cmd.task_stiffness));
+  datastore().assign<std::vector<double>>(TASK_DAMPING_KEY, resolve(TASK_DAMPING_KEY, cmd.task_damping_ratio));
+
+  // Reject a degenerate weight set that leaves the arm (w_ee + w_arm) or the base
+  // (w_base + w_base_posture) with no authority, so neither can float.
+  if(w[0] + w[1] > 1e-9 && w[2] + w[3] > 1e-9)
+  {
+    datastore().assign<std::vector<double>>(TASK_WEIGHTS_KEY, w);
+    weightsDegenerateWarned_ = false;
+  }
+  else if(!weightsDegenerateWarned_)
+  {
+    mc_rtc::log::warning("[CallmWbcController] ignoring task weights with no arm or base authority "
+                         "(arm={}, base={}); keeping previous weights",
+                         w[0] + w[1], w[2] + w[3]);
+    weightsDegenerateWarned_ = true;
+  }
 }
 
 void CallmWbcController::applyCommandsToTasks()
 {
+  // Per-task gains (mode + compliance), order [ee, posture_arm, base, base_posture].
+  // Applied every tick so GUI/ROS changes take effect and the client can blend authority
+  // (high w_ee = Cartesian, high w_posture_arm = joint-space) and shape compliance.
+  const std::vector<double> w = datastore().get<std::vector<double>>(TASK_WEIGHTS_KEY);
+  const std::vector<double> s = datastore().get<std::vector<double>>(TASK_STIFFNESS_KEY);
+  const std::vector<double> zeta = datastore().get<std::vector<double>>(TASK_DAMPING_KEY);
+  auto applyGains = [](const auto & task, double weight, double stiff, double damp)
+  {
+    if(!task) { return; }
+    task->weight(weight);
+    task->setGains(stiff, 2.0 * damp * std::sqrt(std::max(0.0, stiff))); // damping = 2*zeta*sqrt(stiffness)
+  };
+  applyGains(eeTask_, w[0], s[0], zeta[0]);
+  applyGains(postureTask, w[1], s[1], zeta[1]);
+  applyGains(baseTask_, w[2], s[2], zeta[2]);
+  applyGains(triorbPostureTask_, w[3], s[3], zeta[3]);
+
   // Arm end-effector (active).
   if(eeTask_) { eeTask_->target(datastore().get<sva::PTransformd>(EE_TARGET_KEY)); }
 
@@ -272,6 +356,19 @@ void CallmWbcController::applyCommandsToTasks()
     std::map<std::string, std::vector<double>> target;
     for(size_t i = 0; i < armJointNames_.size() && i < arm.size(); ++i) { target[armJointNames_[i]] = {arm[i]}; }
     postureTask->target(target);
+  }
+
+  // Base posture (active): joint-space base target from posture_base. Whether it drives
+  // the base is set by its weight (w_base_posture) vs the velocity-driven base task.
+  if(triorbPostureTask_)
+  {
+    const auto & pb = datastore().get<std::vector<double>>(BASE_POSTURE_KEY);
+    if(pb.size() >= baseJointNames_.size())
+    {
+      std::map<std::string, std::vector<double>> target;
+      for(size_t i = 0; i < baseJointNames_.size(); ++i) { target[baseJointNames_[i]] = {pb[i]}; }
+      triorbPostureTask_->target(target);
+    }
   }
 
   // Base command: exactly one path drives the base transform task.
@@ -412,8 +509,7 @@ void CallmWbcController::reset(const mc_control::ControllerResetData & reset_dat
 
   baseTask_ = std::make_shared<mc_tasks::TransformTask>("base", robots(), 1, baseStiffness_, baseWeight_);
   baseTask_->reset(); // target := current base pose
-  if(baseDamping_ >= 0.0) { baseTask_->setGains(baseStiffness_, baseDamping_); }
-  solver().addTask(baseTask_);
+  solver().addTask(baseTask_); // gains are (re)applied every tick from the datastore, see applyCommandsToTasks
   baseTargetPose_ = baseTask_->target();
 
   // Per-robot constraint + light posture for the base (regularizes base_x/base_y/base_yaw).
@@ -454,6 +550,16 @@ void CallmWbcController::reset(const mc_control::ControllerResetData & reset_dat
   datastore().assign<std::vector<double>>(ARM_POSTURE_KEY, armStandby);
   datastore().assign<std::vector<double>>(BASE_POSTURE_KEY, std::vector<double>(baseJointNames_.size(), 0.0));
   datastore().assign<double>(GRIPPER_OPENING_KEY, 0.0);
+  // Each episode starts from the YAML-default gains; the client picks its mode/compliance
+  // via the WbcData task_weights / task_stiffness / task_damping_ratio fields. Damping is
+  // seeded critical (zeta = 1) for every task; shape it at runtime via task_damping_ratio.
+  datastore().assign<std::vector<double>>(
+      TASK_WEIGHTS_KEY, std::vector<double>{eeWeight_, ur5ePostureWeight_, baseWeight_, triorbPostureWeight_});
+  datastore().assign<std::vector<double>>(
+      TASK_STIFFNESS_KEY,
+      std::vector<double>{eeStiffness_, ur5ePostureStiffness_, baseStiffness_, triorbPostureStiffness_});
+  datastore().assign<std::vector<double>>(TASK_DAMPING_KEY, std::vector<double>{1.0, 1.0, 1.0, 1.0});
+  weightsDegenerateWarned_ = false;
 
   // Push the seeds onto the freshly created tasks once, so the first run() is consistent.
   applyCommandsToTasks();
@@ -591,6 +697,17 @@ WbcData CallmWbcController::collectMeasured() const
   if(datastore().has("RobotiqGripper::opening"))
   {
     m.gripper_opening = datastore().call<double>("RobotiqGripper::opening");
+  }
+
+  // Echo the currently-active per-task gains so the client can read back its mode.
+  const auto & w = datastore().get<std::vector<double>>(TASK_WEIGHTS_KEY);
+  const auto & s = datastore().get<std::vector<double>>(TASK_STIFFNESS_KEY);
+  const auto & zeta = datastore().get<std::vector<double>>(TASK_DAMPING_KEY);
+  for(std::size_t i = 0; i < m.task_weights.size(); ++i)
+  {
+    if(i < w.size()) { m.task_weights[i] = w[i]; }
+    if(i < s.size()) { m.task_stiffness[i] = s[i]; }
+    if(i < zeta.size()) { m.task_damping_ratio[i] = zeta[i]; }
   }
   return m;
 }

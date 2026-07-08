@@ -58,6 +58,10 @@ struct CallmWbcController_DLLAPI CallmWbcController : public mc_control::MCContr
   static constexpr auto ARM_POSTURE_KEY = "CallmWbcController::armPosture"; ///< std::vector<double> (6 UR5e joints)
   static constexpr auto BASE_POSTURE_KEY = "CallmWbcController::basePosture"; ///< std::vector<double> (3), plumbed only
   static constexpr auto GRIPPER_OPENING_KEY = "CallmWbcController::gripperOpening"; ///< double (0 open, 1 closed)
+  // Per-task gains as Eigen::Vector4d, order [ee, posture_arm, base, base_posture].
+  static constexpr auto TASK_WEIGHTS_KEY = "CallmWbcController::taskWeights";
+  static constexpr auto TASK_STIFFNESS_KEY = "CallmWbcController::taskStiffness";
+  static constexpr auto TASK_DAMPING_KEY = "CallmWbcController::taskDampingRatio"; ///< zeta (damping = 2*zeta*sqrt(stiff))
 
 private:
   /** Assemble the robot-module vector (UR5e + TriOrb + ground [+ Robotiq gripper]).
@@ -105,7 +109,6 @@ private:
   double eeWeight_ = 1000.0;
   double baseStiffness_ = 2.0;
   double baseWeight_ = 1000.0;
-  double baseDamping_ = -1.0; ///< <0 => leave the task default (2*sqrt(stiffness)); see run()
   double ur5ePostureStiffness_ = 10.0;
   double ur5ePostureWeight_ = 5.0;
   double triorbPostureStiffness_ = 1.0;
@@ -182,6 +185,8 @@ private:
   bool slamOffsetCaptured_ = false;
   double slamOffX_ = 0.0, slamOffY_ = 0.0, slamOffYaw_ = 0.0;
   bool slamStaleWarned_ = false;
+
+  bool weightsDegenerateWarned_ = false; ///< one-shot warn on a degenerate (no arm authority) weight set
 
   bool ioReady_ = false; ///< guards one-time GUI/datastore setup across resets
 };

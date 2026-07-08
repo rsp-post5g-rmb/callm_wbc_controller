@@ -144,12 +144,14 @@ Three interchangeable ways; the **datastore is the single source of truth**, and
 - `Base velocity [vx, vy, wyaw] (body)` — drive the base by body velocity.
 - `Arm posture [rad]` — the 6 UR5e joints.
 - `Gripper opening (0=open, 1=closed)` — slider.
+- `Task weights [w_ee, w_arm, w_base]` — QP task weights (the "mode": high `w_ee` =
+  Cartesian, high `w_arm` = joint-space).
 - `Base pose (inactive path)` — absolute base pose (only used with `base_command.mode: pose`).
 
 ### b) ROS2 client (`WbcData`)
 
 The controller subscribes to **`callm_wbc/command`** and republishes state on
-**`callm_wbc/measured`** (both `std_msgs/Float64MultiArray`, 20 doubles — layout in
+**`callm_wbc/measured`** (both `std_msgs/Float64MultiArray`, 32 doubles — layout in
 [`src/WbcData.h`](../src/WbcData.h)):
 
 | Field | Size | Active | Notes |
@@ -157,9 +159,20 @@ The controller subscribes to **`callm_wbc/command`** and republishes state on
 | `eef_pos` | 3 | ✅ | EE target position, world frame |
 | `eef_quat` | 4 | ✅ | EE target orientation `(w,x,y,z)` |
 | `posture_arm` | 6 | ✅ | UR5e joints (ref_joint_order) |
-| `posture_base` | 3 | ⛔ plumbed-only | received & stored, not actuated |
+| `posture_base` | 3 | ✅ | TriOrb base joints (joint-space base command) |
 | `gripper_opening` | 1 | ✅ | **0 = open, 1 = closed** |
 | `velocity_base` | 3 | ✅ | `(vx, vy, wyaw)` base body frame |
+| `task_weights` | 4 | ✅ | per-task QP weight = **mode**; `<0` keeps default |
+| `task_stiffness` | 4 | ✅ | per-task tracking gain = **compliance** |
+| `task_damping_ratio` | 4 | ✅ | per-task ζ (`damping = 2ζ√stiffness`) |
+
+Gain vectors are ordered `[ee, posture_arm, base, base_posture]`.
+
+**Modes = gains (client-side).** Weight the tasks to pick behaviour: high `w_ee` =
+Cartesian arm; high `w_posture_arm` with `w_ee=0` = joint-space arm; likewise `w_base`
+(velocity) vs `w_base_posture` (joint) for the base. Lower `task_stiffness` for a soft
+task. Presets `se3` / `direct` / `joint` / `compliant` live in the Python client
+(`WbcData.set_mode("se3")`).
 
 Reference Python client: [`scripts/callm_wbc_client.py`](../scripts/callm_wbc_client.py):
 
