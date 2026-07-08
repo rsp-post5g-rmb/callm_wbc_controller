@@ -1,5 +1,17 @@
 #include <mc_control/mc_global_controller.h>
 
+#include <cstdlib> // std::_Exit
+
+// NOTE on shutdown: mc_rtc's ROS plugin keeps a process-wide static singleton
+// (ROSBridgeImpl) whose RobotPublishers connect a Slot to Robots::onRobotRemoved().
+// That static is destroyed at process exit -- AFTER the local MCGlobalController (and
+// its Robots signal) is already gone -- so its ~Slot calls Signal::disconnect() on a
+// freed Robots, a use-after-free that segfaults during normal `return` teardown.
+// (Violates the SignalSlot contract: the emitter must outlive its subscribers.) The
+// bug is in mc_rtc, not this controller; the controller runs the smoke test to
+// completion. We therefore end the test with std::_Exit, which skips both local and
+// static destructors and avoids the dangling-signal teardown path entirely.
+
 int main(int argc, char * argv[])
 {
   if(argc < 2)
@@ -55,9 +67,11 @@ int main(int argc, char * argv[])
     simulateSensors();
     if(!gc.run())
     {
-      return 1;
+      std::cout.flush();
+      std::_Exit(1); // skip the mc_rtc ROS-plugin static-teardown UAF (see note above)
     }
   }
 
-  return 0;
+  std::cout.flush();
+  std::_Exit(0); // controller ran to completion; skip destructors to avoid the teardown UAF
 }

@@ -584,7 +584,12 @@ void CallmWbcController::reset(const mc_control::ControllerResetData & reset_dat
 void CallmWbcController::setupRos()
 {
   rosContext_ = std::make_shared<rclcpp::Context>();
-  rosContext_->init(0, nullptr);
+  // mc_rtc's ROS plugin already owns the global rclcpp logging system. Initializing it
+  // again from our private context triggers "logging was initialized more than once" and
+  // a double logging-shutdown at teardown (segfault). Defer logging to mc_rtc's context.
+  rclcpp::InitOptions initOptions;
+  initOptions.auto_initialize_logging(false);
+  rosContext_->init(0, nullptr, initOptions);
 
   rclcpp::NodeOptions options;
   options.context(rosContext_);
