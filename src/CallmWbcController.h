@@ -133,6 +133,7 @@ private:
   std::string gripperModule_ = "Robotiq2f85Gripper"; ///< RobotLoader name (mc_robot_tools)
   std::string gripperRobot_ = "robotiq_2f_85_gripper"; ///< robot name = module name
   std::string gripperBaseSurface_ = "Base"; ///< planar surface on the gripper base link
+  std::string gripperBaseLink_ = "robotiq_85_base_link"; ///< base link for the runtime attachment surface
   std::string gripperSetOpeningCall_ = "RobotiqGripper::setOpening"; ///< mc_robotiq datastore call
 
   // Joint orders (verified against the module ref_joint_order).

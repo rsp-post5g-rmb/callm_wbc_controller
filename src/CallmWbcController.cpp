@@ -96,8 +96,25 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
     g("model", gripperModule_);
     g("set_opening_call", gripperSetOpeningCall_);
   }
-  gripperRobot_ = (gripperModule_.find("140") != std::string::npos) ? "robotiq_2f_140_gripper" : "robotiq_2f_85_gripper";
+  const bool is140 = gripperModule_.find("140") != std::string::npos;
+  gripperRobot_ = is140 ? "robotiq_2f_140_gripper" : "robotiq_2f_85_gripper";
+  gripperBaseLink_ = is140 ? "robotiq_140_base_link" : "robotiq_85_base_link";
   gripperEnabled_ = robots().hasRobot(gripperRobot_);
+
+  // Ensure the gripper has the attachment surface used by the Tool<->Base contact in
+  // reset(). mc_robot_tools ships it in an RSDF, but that RSDF is not always installed
+  // where mc_rtc looks; add an equivalent planar surface at runtime if it is missing
+  // (same approach as the TriOrb ArmMount surface). Footprint matches the RSDF (+-0.0375).
+  if(gripperEnabled_ && !robot(gripperRobot_).hasSurface(gripperBaseSurface_))
+  {
+    std::vector<std::pair<double, double>> gPts = {
+        {-0.0375, -0.0375}, {0.0375, -0.0375}, {0.0375, 0.0375}, {-0.0375, 0.0375}};
+    robot(gripperRobot_)
+        .addSurface(std::make_shared<mc_rbdyn::PlanarSurface>(gripperBaseSurface_, gripperBaseLink_,
+                                                              sva::PTransformd::Identity(), "plastic", gPts));
+    mc_rtc::log::info("[CallmWbcController] added runtime '{}' surface on {}::{}", gripperBaseSurface_, gripperRobot_,
+                      gripperBaseLink_);
+  }
 
   // ---- ROS interface options -----------------------------------------------
   if(config.has("ros"))
