@@ -52,7 +52,7 @@ e_3 = \operatorname{err}_{SE(3)}\!\big(X_{F_B},\, X^\star_{\mathrm{base}}\big),
 \qquad J_3 = J_{F_B},\qquad a_3^{\mathrm{ff}} \leftrightarrow \operatorname{refVelB} = V_b
 $$
 
-velocity command integrated into the target: $\;X^\star_{\mathrm{base}} \leftarrow X^\star_{\mathrm{base}}\,\exp(\widehat{V_b}\,\Delta t),\ \ V_b = (v_x,\,v_y,\,0,\,0,\,0,\,\omega).$
+velocity command re-based off the current pose each tick: $\;X^\star_{\mathrm{base}} \leftarrow X_{F_B}\,\exp(\widehat{V_b}\,\Delta t),\ \ V_b = (v_x,\,v_y,\,0,\,0,\,0,\,\omega)$ — see [`base_velocity_target.md`](base_velocity_target.md).
 
 **T4 — Base posture** (`PostureTask`, TriOrb)
 

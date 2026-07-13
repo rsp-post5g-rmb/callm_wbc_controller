@@ -423,13 +423,22 @@ void CallmWbcController::applyCommandsToTasks()
 void CallmWbcController::integrateBaseVelocity()
 {
   const auto vel = datastore().get<Eigen::Vector3d>(BASE_VELOCITY_KEY); // (vx, vy, wyaw) in the base body frame
-  const auto & R = baseTargetPose_.rotation();
-  double yaw = std::atan2(R(0, 1), R(0, 0)); // SVA RotZ convention, matches setupTargetsIO
-  const double c = std::cos(yaw), s = std::sin(yaw);
   const double vx = vel.x(), vy = vel.y(), wz = vel.z();
   const double dt = solver().dt();
 
-  Eigen::Vector3d t = baseTargetPose_.translation();
+  // Re-base the target off the CURRENT base pose each tick (a one-step-ahead "carrot"),
+  // NOT off a persistent accumulator. This keeps the position error bounded at ~v*dt, so
+  // the target can never wind up when the base cannot track the command (conflicting
+  // tasks / constraints) and it self-anchors to the SLAM-grounded pose on hardware
+  // (bodyPosW == QP-integrated pose in sim, SLAM pose on real -- same code path).
+  // Trade-off: the base is velocity-controlled (motion via the refVelB feed-forward);
+  // it does NOT catch up on lag. See docs/base_velocity_target.md.
+  const sva::PTransformd Xcur = robots().robot("triorb").bodyPosW("base");
+  const auto & R = Xcur.rotation();
+  double yaw = std::atan2(R(0, 1), R(0, 0)); // SVA RotZ convention (planar base)
+  const double c = std::cos(yaw), s = std::sin(yaw);
+
+  Eigen::Vector3d t = Xcur.translation();
   t.x() += (c * vx - s * vy) * dt; // body -> world
   t.y() += (s * vx + c * vy) * dt;
   yaw += wz * dt;
