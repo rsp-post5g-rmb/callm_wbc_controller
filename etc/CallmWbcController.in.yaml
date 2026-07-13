@@ -31,9 +31,11 @@ ur5e_posture:
 
 # NOTE on damping: task damping is seeded critical (2*sqrt(stiffness)) for every task.
 # There is no per-task YAML damping knob -- shape damping at runtime, per task, via the
-# WbcData `task_damping_ratio` field (zeta; damping = 2*zeta*sqrt(stiffness), zeta=1 =
-# critical). mc_rtc has no generic "damping task" (mc_tasks::force::DampingTask is an
-# admittance/force task needing a force sensor).
+# WbcData `task_damping_ratio` field: it is the damping ratio zeta when stiffness > 0
+# (damping = 2*zeta*sqrt(stiffness), zeta=1 = critical), and the ABSOLUTE damping D when
+# stiffness = 0 (a zero-stiffness task then acts as a pure velocity damper -- e.g.
+# immobilize the base via the base posture task; see docs/gains.md). mc_rtc has no
+# generic "damping task" (mc_tasks::force::DampingTask is an admittance/force task).
 
 # How the base is driven: "velocity" (active -- from velocity_base) or "pose"
 # (inactive/overridable -- from the Base target [world] GUI marker / BASE_TARGET_KEY).

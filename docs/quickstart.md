@@ -164,7 +164,7 @@ The controller subscribes to **`callm_wbc/command`** and republishes state on
 | `velocity_base` | 3 | ✅ | `(vx, vy, wyaw)` base body frame |
 | `task_weights` | 4 | ✅ | per-task QP weight = **mode**; `<0` keeps default |
 | `task_stiffness` | 4 | ✅ | per-task tracking gain = **compliance** |
-| `task_damping_ratio` | 4 | ✅ | per-task ζ (`damping = 2ζ√stiffness`) |
+| `task_damping_ratio` | 4 | ✅ | ζ when stiffness>0 (`D=2ζ√K`); absolute D when stiffness=0 (velocity damper) |
 
 Gain vectors are ordered `[ee, posture_arm, base, base_posture]`.
 

@@ -81,7 +81,7 @@ carries all fields every message:
 | `velocity_base` | 3 (vx,vy,wyaw) | yes | base body velocity |
 | `task_weights` | 4 | yes | per-task QP weight — **selects the "mode"** |
 | `task_stiffness` | 4 | yes | per-task tracking gain — **compliance** |
-| `task_damping_ratio` | 4 | yes | per-task ζ (`damping = 2ζ√stiffness`, ζ=1 critical) |
+| `task_damping_ratio` | 4 | yes | ζ when stiffness > 0 (`D = 2ζ√K`, ζ=1 critical); **absolute D** when stiffness = 0 ([gains.md](docs/gains.md)) |
 
 The three gain vectors are ordered **`[ee, posture_arm, base, base_posture]`**.
 
@@ -95,7 +95,10 @@ clamped `>= 0`). So the client picks behaviour by weighting tasks:
 - **base**: high `w_base` = velocity-driven (from `velocity_base`); high `w_base_posture`
   with `w_base = 0` = joint-space (`posture_base` drives `base_x/base_y/base_yaw`).
 - **compliance**: lower `task_stiffness` for a soft/springy task; `task_damping_ratio`
-  shapes overshoot (ζ = 1 critical; only lower it deliberately).
+  shapes overshoot (ζ = 1 critical; only lower it deliberately). Set a task's stiffness
+  to 0 to turn it into a pure **velocity damper** (then `task_damping_ratio` is the
+  absolute damping D) — e.g. immobilize the base via the base posture task; see
+  [`docs/gains.md`](docs/gains.md).
 
 Presets (`se3`, `direct`, `joint`, `compliant`) live in the Python client
 (`scripts/callm_wbc_client.py`, `MODE_PRESETS` / `WbcData.set_mode()`); the active

@@ -363,7 +363,12 @@ void CallmWbcController::applyCommandsToTasks()
   {
     if(!task) { return; }
     task->weight(weight);
-    task->setGains(stiff, 2.0 * damp * std::sqrt(std::max(0.0, stiff))); // damping = 2*zeta*sqrt(stiffness)
+    // `damp` is the damping ratio zeta when stiffness > 0 (D = 2*zeta*sqrt(K), zeta=1 =
+    // critical); when stiffness == 0 it is the ABSOLUTE damping D, so a zero-stiffness
+    // task becomes a pure velocity damper (e.g. immobilize the base) instead of going
+    // inert (2*zeta*sqrt(0) = 0). See docs/gains.md.
+    const double D = (stiff > 0.0) ? 2.0 * damp * std::sqrt(stiff) : damp;
+    task->setGains(stiff, D);
   };
   applyGains(eeTask_, w[0], s[0], zeta[0]);
   applyGains(postureTask, w[1], s[1], zeta[1]);

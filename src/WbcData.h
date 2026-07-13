@@ -22,8 +22,10 @@
  *                             high w_posture_arm = joint-space arm; likewise w_base vs
  *                             w_base_posture for the base)
  *     - task_stiffness     -> per-task tracking gain (compliance axis)
- *     - task_damping_ratio -> per-task damping ratio zeta (damping = 2*zeta*sqrt(stiff);
- *                             zeta = 1 => critically damped)
+ *     - task_damping_ratio -> per-task damping: when stiffness > 0 this is the damping
+ *                             ratio zeta (D = 2*zeta*sqrt(stiff), zeta = 1 => critical);
+ *                             when stiffness == 0 it is the ABSOLUTE damping D, so a
+ *                             zero-stiffness task acts as a pure velocity damper.
  *
  * Every gain uses the sentinel: a value < 0 means "keep the current (YAML-default)
  * value"; >= 0 is adopted (weights/stiffness clamped >= 0).
@@ -56,7 +58,7 @@ struct WbcData
   // Per-task gains, order: [ee, posture_arm, base, base_posture]. <0 = keep default.
   std::array<double, 4> task_weights = {-1.0, -1.0, -1.0, -1.0};
   std::array<double, 4> task_stiffness = {-1.0, -1.0, -1.0, -1.0};
-  std::array<double, 4> task_damping_ratio = {-1.0, -1.0, -1.0, -1.0}; ///< zeta; damping = 2*zeta*sqrt(stiffness)
+  std::array<double, 4> task_damping_ratio = {-1.0, -1.0, -1.0, -1.0}; ///< zeta (K>0); absolute damping D (K==0)
 
   // ---- Flat layout (offsets into the serialized array) ----------------------
   static constexpr std::size_t EEF_POS_OFFSET = 0;

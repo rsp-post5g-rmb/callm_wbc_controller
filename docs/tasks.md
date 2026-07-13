@@ -21,10 +21,15 @@ Per-task reference acceleration (PD + feedforward):
 
 $$
 a_i \;=\; -K_i\,e_i \;-\; D_i\,\dot e_i \;+\; a_i^{\mathrm{ff}},
-\qquad K_i = s_i I,\quad D_i = 2\,\zeta_i\sqrt{s_i}\, I
+\qquad K_i = s_i I,\quad
+D_i =
+\begin{cases}
+2\,\zeta_i\sqrt{s_i}\, I & s_i > 0\\
+\zeta_i I & s_i = 0\ (\text{absolute}\ D;\ \text{pure velocity damper})
+\end{cases}
 $$
 
-Gains $(w_i,\, s_i,\, \zeta_i)$ = (weight, stiffness, damping ratio), set per task via
+Gains $(w_i,\, s_i,\, \zeta_i)$ = (weight, stiffness, damping), set per task via
 `WbcData` in order $[\,\text{ee},\ \text{posture\_arm},\ \text{base},\ \text{base\_posture}\,]$.
 
 Integration: $\;\dot q \leftarrow \dot q + \ddot q^\star \Delta t,\quad q \leftarrow q \oplus \dot q\,\Delta t.$
