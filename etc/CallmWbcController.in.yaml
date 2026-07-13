@@ -51,15 +51,18 @@ gripper_posture:
   weight: 1.0
 
 # ---- Robotiq gripper -------------------------------------------------------
-# The gripper is a separate ConnectableRobotModule (mc_robot_tools) loaded as an
-# extra robot and bolted onto the UR5e "Tool" surface in reset(). Commanding the
-# physical gripper is done through the mc_robotiq GlobalPlugin datastore call
-# `RobotiqGripper::setOpening` (0 = open, 1 = closed); enable that plugin in the
-# global mc_rtc.yaml (see tests/etc/mc_rtc.yaml). If the module/plugin are absent
-# the controller runs without the gripper.
+# Two INDEPENDENT switches:
+#   simulate : load the gripper MODEL (a mc_robot_tools ConnectableRobotModule) as an
+#              extra robot and bolt it onto the UR5e "Tool" surface for visualization
+#              /collision. On this branch it is OFF -- we do not simulate the gripper.
+#   command  : forward gripper_opening to the mc_robotiq GlobalPlugin datastore call
+#              `RobotiqGripper::setOpening` (0 = open, 1 = closed) to drive the REAL
+#              gripper. This does NOT need the model, so it stays ON.
+# Enable the RobotiqGripperPlugin in the global mc_rtc.yaml for the command path.
 gripper:
-  enable: true
-  model: Robotiq2f85Gripper        # or Robotiq2f140Gripper
+  simulate: false                  # do not load the mc_robot_tools gripper model
+  command: true                    # still drive the real gripper via the plugin
+  model: Robotiq2f85Gripper        # or Robotiq2f140Gripper (used only when simulate: true)
   set_opening_call: "RobotiqGripper::setOpening"
 
 # ---- ROS2 command client ---------------------------------------------------

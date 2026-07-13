@@ -13,12 +13,17 @@ controller (no scripted phase machine) driven by a ROS2 command client.
 Model
 --
 
+> **Branch `no_gripper_sim`:** the gripper **model** is not loaded/simulated
+> (`gripper.simulate: false`) — so this build has no dependency on the
+> `mc_robot_tools` gripper module — but the **real** gripper is still driven via the
+> `mc_robotiq` plugin (`gripper.command: true`). See the gripper notes below.
+
 | Index | Robot | Role |
 | --- | --- | --- |
 | 0 | `UR5eFloatingBase` | main robot, arm with a floating base |
 | 1 | `triorb` | the mobile base |
 | 2 | `env/ground` | visual reference only |
-| 3 | `robotiq_2f_85_gripper` | gripper, bolted onto the UR5e tool (optional) |
+| (3) | `robotiq_2f_85_gripper` | gripper model — **only when `gripper.simulate: true`** (off on this branch) |
 
 - The UR5e floating base is rigidly attached to the TriOrb `mount` link through a
   Base&harr;Base contact. When the QP moves the base the arm follows; when the
@@ -29,19 +34,22 @@ Model
   planar motion is intrinsic to the kinematics and solved directly by the QP.
 - The TriOrb description ships no RSDF surfaces, so the attachment surface
   `ArmMount` is declared on the `mount` link at runtime, in the constructor.
-- The **Robotiq gripper** is a separate `ConnectableRobotModule` (from
-  `mc_robot_tools`, module names `Robotiq2f85Gripper` / `Robotiq2f140Gripper`),
-  loaded as an extra robot and bolted onto the UR5e `Tool` surface via a rigid
-  `Tool`&harr;`Base` contact using the module's own `defaultMountingTransform`
-  (`RotZ(pi)`). It is **not** a mimic-jointed part of the arm module. If the
-  module is not on the path the controller runs without it.
+- The **Robotiq gripper** has two independent switches:
+  - `gripper.simulate` — load the gripper **model** (a `mc_robot_tools`
+    `ConnectableRobotModule`, `Robotiq2f85Gripper` / `Robotiq2f140Gripper`) as an
+    extra robot and bolt it onto the UR5e `Tool` surface via a rigid
+    `Tool`&harr;`Base` contact (`defaultMountingTransform` = `RotZ(pi)`). **Off on
+    this branch**, so there is no `mc_robot_tools` dependency.
+  - `gripper.command` — forward `gripper_opening` to the `mc_robotiq` plugin
+    (`RobotiqGripper::setOpening`) to drive the **real** gripper. **On.** This path
+    is independent of the model: it only needs the plugin's datastore call to exist.
 
 Tasks / constraints
 --
 
 - `contactConstraint`, `kinematicsConstraint` (UR5e), `selfCollisionConstraint`
-  (UR5e), plus a per-robot `KinematicsConstraint` for the TriOrb and one for the
-  gripper.
+  (UR5e), plus a per-robot `KinematicsConstraint` for the TriOrb (and one for the
+  gripper only when `gripper.simulate: true`).
 - **Arm&harr;base collision avoidance** via `addCollisions("ur5e", "triorb", ...)`.
   mc_rtc auto-builds an `sch::S_Box` collision convex (named `base`) from the
   TriOrb URDF `<box>`, so no hull file is needed. Guarded links and distances are
@@ -50,7 +58,7 @@ Tasks / constraints
 - `SurfaceTransformTask` on the UR5e `Tool` surface (arm end-effector).
 - `TransformTask` on the TriOrb `base` body (base command).
 - `PostureTask` for the UR5e (arm redundancy), a light `PostureTask` for the base,
-  and a light `PostureTask` holding the gripper knuckle joints.
+  and (when the gripper is simulated) a light `PostureTask` holding its knuckle joints.
 - **Damping:** there is *no* generic "damping task" in mc_rtc &mdash;
   `mc_tasks::force::DampingTask` is an admittance/force-control task that requires
   a force sensor. Damping/regularization here is the `damping` coefficient of the
@@ -159,12 +167,14 @@ Build
 --
 
 Built inside `mc_rtc_superbuild`. Register it with `AddProject` in
-`extensions/local.cmake` and make it `DEPENDS` on the UR5e, TriOrb and Robotiq
-gripper robot-module projects (`mc_ur5e`, `mc_triorb_module`, `mc_robot_tools`)
-and on `mc_robotiq` (the gripper plugin) &mdash; runtime plugins, so these are
-build-ordering dependencies only. The controller links `mc_rtc::mc_rtc_ros` for
-the ROS2 client (`rclcpp` + `std_msgs` come transitively). To run, set in your
-global `mc_rtc.yaml`:
+`extensions/local.cmake` and make it `DEPENDS` on the UR5e and TriOrb robot-module
+projects (`mc_ur5e`, `mc_triorb_module`) and on `mc_robotiq` (the gripper plugin)
+&mdash; runtime plugins, so these are build-ordering dependencies only. **On this
+branch `mc_robot_tools` is NOT required** (the gripper model is not loaded), so you
+can drop it from the `DEPENDS` and from `local.cmake` to avoid its build issues; the
+real gripper is still driven through the `mc_robotiq` plugin. The controller links
+`mc_rtc::mc_rtc_ros` for the ROS2 client (`rclcpp` + `std_msgs` come transitively).
+To run, set in your global `mc_rtc.yaml`:
 
 ```yaml
 MainRobot: UR5eFloatingBase

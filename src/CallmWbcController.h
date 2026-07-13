@@ -128,8 +128,13 @@ private:
   std::string baseCommandMode_ = "velocity";
   sva::PTransformd baseTargetPose_ = sva::PTransformd::Identity(); ///< integrated base setpoint
 
-  // Robotiq gripper (separate loaded robot, attached to the UR5e Tool surface).
-  bool gripperEnabled_ = true;
+  // Robotiq gripper. Two independent switches:
+  //  - gripperEnabled_ : the gripper MODEL is loaded + attached (simulation/visualization).
+  //  - gripperCommandEnabled_ : forward gripper_opening to the mc_robotiq plugin (real gripper).
+  // The command path does NOT require the model, so the real gripper can be driven with
+  // no mc_robot_tools model loaded (gripper.simulate=false, gripper.command=true).
+  bool gripperEnabled_ = true; ///< set from robots().hasRobot(gripperRobot_) (model loaded)
+  bool gripperCommandEnabled_ = true; ///< forward opening to RobotiqGripper::setOpening
   std::string gripperModule_ = "Robotiq2f85Gripper"; ///< RobotLoader name (mc_robot_tools)
   std::string gripperRobot_ = "robotiq_2f_85_gripper"; ///< robot name = module name
   std::string gripperBaseSurface_ = "Base"; ///< planar surface on the gripper base link

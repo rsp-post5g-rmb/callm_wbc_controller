@@ -40,15 +40,20 @@ std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn:
   // mc_robot_tools ("Robotiq2f85Gripper" / "Robotiq2f140Gripper"), loaded here as a
   // separate robot and bolted onto the UR5e tool in reset(). If the module is not on
   // the path we log and continue without it rather than aborting construction.
-  bool gripperEnabled = true;
+  //
+  // `gripper.simulate` controls loading this MODEL only; commanding the real gripper
+  // goes through the mc_robotiq plugin (gripper.command) and is independent of it. Set
+  // simulate=false to run without the mc_robot_tools gripper model entirely.
+  bool gripperSimulate = true;
   std::string gripperModule = "Robotiq2f85Gripper";
   if(config.has("gripper"))
   {
     auto g = config("gripper");
-    g("enable", gripperEnabled);
+    g("enable", gripperSimulate); // legacy alias
+    g("simulate", gripperSimulate);
     g("model", gripperModule);
   }
-  if(gripperEnabled)
+  if(gripperSimulate)
   {
     try
     {
@@ -89,17 +94,18 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   // ---- Base command routing (velocity is the active path) ------------------
   if(config.has("base_command")) { config("base_command")("mode", baseCommandMode_); }
 
-  // ---- Gripper naming (derived from the selected model) --------------------
+  // ---- Gripper naming + command switch -------------------------------------
   if(config.has("gripper"))
   {
     auto g = config("gripper");
     g("model", gripperModule_);
     g("set_opening_call", gripperSetOpeningCall_);
+    g("command", gripperCommandEnabled_); // forward opening to the mc_robotiq plugin (real gripper)
   }
   const bool is140 = gripperModule_.find("140") != std::string::npos;
   gripperRobot_ = is140 ? "robotiq_2f_140_gripper" : "robotiq_2f_85_gripper";
   gripperBaseLink_ = is140 ? "robotiq_140_base_link" : "robotiq_85_base_link";
-  gripperEnabled_ = robots().hasRobot(gripperRobot_);
+  gripperEnabled_ = robots().hasRobot(gripperRobot_); // model loaded (independent of command)
 
   // Ensure the gripper has the attachment surface used by the Tool<->Base contact in
   // reset(). mc_robot_tools ships it in an RSDF, but that RSDF is not always installed
@@ -183,7 +189,8 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   setupTargetsIO();
   setupRos();
 
-  mc_rtc::log::success("CallmWbcController init done (gripper: {})", gripperEnabled_ ? gripperRobot_ : "disabled");
+  mc_rtc::log::success("CallmWbcController init done (gripper model: {}, command: {})",
+                       gripperEnabled_ ? gripperRobot_ : "not simulated", gripperCommandEnabled_ ? "on" : "off");
 }
 
 CallmWbcController::~CallmWbcController()
@@ -403,8 +410,10 @@ void CallmWbcController::applyCommandsToTasks()
     }
   }
 
-  // Gripper (active): forward to the mc_robotiq plugin if it is loaded.
-  if(gripperEnabled_ && datastore().has(gripperSetOpeningCall_))
+  // Gripper (active): forward the opening to the mc_robotiq plugin (real gripper). This
+  // is independent of whether the gripper MODEL is loaded -- only the plugin's datastore
+  // call needs to exist.
+  if(gripperCommandEnabled_ && datastore().has(gripperSetOpeningCall_))
   {
     double opening = datastore().get<double>(GRIPPER_OPENING_KEY);
     datastore().call(gripperSetOpeningCall_, opening);
