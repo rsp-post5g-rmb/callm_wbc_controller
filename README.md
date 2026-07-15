@@ -159,8 +159,9 @@ drives the **UR5e arm** (position mode). The **base** and **gripper** are mc_rtc
   package.
 - **Base command → TriorbBasePlugin.** After the QP, `run()` exports the
   QP-realized base velocity (`triorb` `mbc().alpha`) rotated into the base body
-  frame (on the measured/VO yaw when alive) to the plugin's `Triorb::cmd_velocity`
-  datastore key; the plugin must be configured `command_in_world_frame: false`.
+  frame (on the measured/VO yaw under closed-loop feedback, else the control yaw) to
+  the plugin's `Triorb::cmd_velocity` datastore key; the plugin must be configured
+  `command_in_world_frame: false`.
 - **Gripper → RobotiqGripperPlugin** via `RobotiqGripper::setOpening` as before.
 
 With no VO publisher and no plugins (pure RViZ sim), run with `feedback: none`: the

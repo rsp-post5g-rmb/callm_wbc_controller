@@ -88,6 +88,11 @@ private:
   /** True when the VisualOdometryObserver has a fresh base fix (datastore VO::isAlive). */
   bool voAlive() const;
 
+  /** True when the base task/export should reference the MEASURED base pose (realRobots):
+   *  only under a closed-loop feedback mode AND a fresh VO fix. Under open-loop (none/joints)
+   *  the control base is never grounded to realRobots, so VO must not move the control base. */
+  bool useMeasuredBase() const;
+
   // ---- ROS2 interface (own context + executor + spin thread) ----------------
   void setupRos();
   void stopRos();

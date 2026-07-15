@@ -119,8 +119,9 @@ observers (bracketed entries do not update the real robot).
      (`ObserverPipeline.cpp:170`) so the last good real pose is held.
 2. **Controller `run()`**:
    - ROS command → datastore → live tasks/gains.
-   - Base-target re-base anchor read from `realRobot("triorb")` when VO is alive
-     (else the control base, preserving pure-sim motion).
+   - Base-target re-base anchor read from `realRobot("triorb")` only under closed-loop
+     feedback with fresh VO (`useMeasuredBase()`), else the control base (so open-loop
+     VO does not move the control base; pure sim keeps moving).
    - `MCController::run(fType)` — the QP; under a closed-loop `fType` it resets the
      control copy from the (now consistent) real copy before solving.
    - `exportBaseVelocity()` — the QP-realised **control** base velocity (the
@@ -159,21 +160,25 @@ target = (current base pose) ⊕ (commanded velocity × dt)
 so the target is re-anchored to where the base is *now* and stepped forward one
 tick (this is the anti-wind-up re-basing, see
 [`base_velocity_target.md`](base_velocity_target.md)). The **anchor** — "current
-base pose" — must mean *where the base actually is*. Its source depends on VO:
+base pose" — must be *the state the QP builds at this tick*, which is decided by the
+**feedback mode**, not merely by whether VO is publishing:
 
-| Situation | Anchor source | Why |
+| Situation (`useMeasuredBase()`) | Anchor source | Why |
 |---|---|---|
-| VO alive (hardware) | `realRobot("triorb").bodyPosW("base")` | the observer wrote the true pose this tick; the control base is not the measurement |
-| VO absent (pure sim) | `robots().robot("triorb").bodyPosW("base")` | `realRobot` is frozen at the reset pose; only the control base moves (QP integration) |
+| closed-loop (`observed`/`observed_real`) **and** VO fresh | `realRobot("triorb").bodyPosW("base")` | the QP resets the control base to `realRobot` before solving, so the target must be relative to `realRobot` (`TasksQPSolver.cpp:304`) |
+| open-loop (`none`/`joints`), or VO stale | `robots().robot("triorb").bodyPosW("base")` | the control base is **not** grounded to `realRobots`, so it re-bases off itself; VO updates `realRobots()` only and does **not** move the control base |
 
 ```cpp
-anchor = VO_alive ? realRobot("triorb").bodyPosW("base")
-                  : robots().robot("triorb").bodyPosW("base");
+useMeasuredBase() = isClosedLoop(feedback) && voAlive();
+anchor = useMeasuredBase() ? realRobot("triorb").bodyPosW("base")
+                           : robots().robot("triorb").bodyPosW("base");
 ```
 
-Anchoring to `realRobot` in sim would peg the target to *(frozen reset pose + one
-tick)* every tick — a fixed point — and the base would never progress. The guard
-prevents that.
+Gating on the feedback mode (not just VO) is deliberate: under `feedback: none` with VO
+publishing, anchoring to `realRobot` would make the base task servo the **control** base
+toward the VO pose — surprising, since open-loop should leave the control base
+independent of VO. In pure sim it would also peg the target to *(frozen reset pose + one
+tick)* and stall the base. The guard prevents both.
 
 **Timing — why `FeedbackType` does not cover this.** Within one tick:
 
@@ -182,15 +187,18 @@ prevents that.
 3. `MCController::run(fType)` → the QP, where a closed-loop `fType` resets the
    control base from `realRobot` (`TasksQPSolver.cpp:304`)
 
-The anchor is read at step 2, but the closed-loop reset only happens at step 3 — so
-at step 2 the control base still holds *last* tick's value. Reading `realRobot`
-directly (refreshed at step 1) is the only way to anchor off the current
-measurement, independent of the chosen feedback mode.
+The closed-loop reset only happens at step 3, but the anchor is read at step 2 — where
+the control base still holds *last* tick's value. So **when closed-loop is selected**,
+reading `realRobot` at step 2 (refreshed at step 1) is the only way to anchor off the
+pose the QP is about to build at. When open-loop is selected, the QP builds at the
+control base itself, so that is the correct anchor — hence `useMeasuredBase()` gates on
+the feedback mode, not just on VO.
 
 **"VO alive"** is the observer's health flag: a fresh message arrived within
-`timeout`. It is exposed on the datastore (`VO::isAlive`, mirroring
-`SLAMObserver.cpp:239`) and drives both the staleness failure mode and this anchor
-switch, so a VO dropout automatically falls back to the control-base anchor.
+`timeout`, exposed on the datastore (`VO::isAlive`, mirroring `SLAMObserver.cpp:239`).
+It is one of the two `useMeasuredBase()` conditions (with a closed-loop feedback mode)
+and also drives the staleness failure mode, so a VO dropout falls back to the
+control-base anchor.
 
 ## Topic contract
 
@@ -246,7 +254,9 @@ Savitzky–Golay, as `SLAMObserver` does for pose) is the v2 alternative.
 - Removed: the controller's own SLAM subscription / `handleSlamPose` / `SlamPose` /
   `base_state.from_slam` machinery — the observer now owns the VO subscription.
 - `MCController::run()` call takes a configurable `FeedbackType` (`feedback` key).
-- Base-target re-base anchor is read from `realRobot("triorb")` when VO is alive.
+- Base-target re-base anchor and export yaw read `realRobot("triorb")` only under
+  closed-loop feedback with fresh VO (`useMeasuredBase()`); open-loop leaves the control
+  base independent of VO.
 - `exportBaseVelocity()` still exports the control (commanded) base velocity.
 
 The observer itself lives in a separate package (`VisualOdometryObserver`,

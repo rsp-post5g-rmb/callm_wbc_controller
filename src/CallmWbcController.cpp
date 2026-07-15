@@ -444,13 +444,14 @@ void CallmWbcController::integrateBaseVelocity()
   // Re-base the target off the CURRENT base pose each tick (a one-step-ahead "carrot"),
   // NOT off a persistent accumulator. This keeps the position error bounded at ~v*dt, so
   // the target can never wind up when the base cannot track the command (conflicting
-  // tasks / constraints). The anchor is the MEASURED base pose (realRobot, updated by the
-  // VisualOdometryObserver this tick) when VO is alive, else the control-robot base (which
-  // moves by QP integration) so pure sim keeps progressing -- see docs/observer.md.
+  // tasks / constraints). The anchor is the MEASURED base pose (realRobot) only under a
+  // closed-loop feedback mode with fresh VO -- the state the QP builds at; otherwise the
+  // control-robot base (self-rebase), so open-loop VO does NOT move the control base and
+  // pure sim keeps progressing. See docs/observer.md.
   // Trade-off: the base is velocity-controlled (motion via the refVelB feed-forward);
   // it does NOT catch up on lag. See docs/base_velocity_target.md.
-  const sva::PTransformd Xcur = voAlive() ? realRobot("triorb").bodyPosW("base")
-                                          : robots().robot("triorb").bodyPosW("base");
+  const sva::PTransformd Xcur = useMeasuredBase() ? realRobot("triorb").bodyPosW("base")
+                                                  : robots().robot("triorb").bodyPosW("base");
   const auto & R = Xcur.rotation();
   double yaw = std::atan2(R(0, 1), R(0, 0)); // SVA RotZ convention (planar base)
   const double c = std::cos(yaw), s = std::sin(yaw);
@@ -473,6 +474,17 @@ bool CallmWbcController::voAlive() const
   return datastore().has("VO::isAlive") && datastore().call<bool>("VO::isAlive");
 }
 
+bool CallmWbcController::useMeasuredBase() const
+{
+  // Reference the measured base (realRobots) only when the QP is actually closing the loop
+  // on realRobots (observed / observed_real) AND VO is fresh. Under open-loop (none/joints)
+  // the control base is never grounded to realRobots -- the base re-bases off the control
+  // robot itself, so VO updates realRobots() only and does NOT move the control base.
+  const bool closedLoop = feedbackType_ == mc_solver::FeedbackType::ObservedRobots
+                          || feedbackType_ == mc_solver::FeedbackType::ClosedLoopIntegrateReal;
+  return closedLoop && voAlive();
+}
+
 void CallmWbcController::exportBaseVelocity()
 {
   // Only active when the TriorbBasePlugin is loaded (it registers this key).
@@ -483,8 +495,8 @@ void CallmWbcController::exportBaseVelocity()
   const double yd = tri.mbc().alpha[tri.jointIndexByName("base_y")][0]; // world-frame ẏ (commanded)
   const double wz = tri.mbc().alpha[tri.jointIndexByName("base_yaw")][0]; // θ̇ (commanded)
   // Rotate the commanded world velocity into the *measured* base body frame the plugin
-  // expects: use realRobot's yaw (VO) when alive, else the control-robot yaw (sim).
-  const double yaw = voAlive()
+  // expects: use realRobot's yaw (VO) under closed-loop feedback, else the control yaw.
+  const double yaw = useMeasuredBase()
                          ? realRobot("triorb").mbc().q[realRobot("triorb").jointIndexByName("base_yaw")][0]
                          : tri.mbc().q[tri.jointIndexByName("base_yaw")][0];
   const double c = std::cos(yaw), s = std::sin(yaw);

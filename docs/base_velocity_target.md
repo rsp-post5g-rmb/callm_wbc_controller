@@ -74,10 +74,10 @@ feed-forward; the near-zero position error means the stiffness term barely acts)
 *source* of the anchor $X_B$ differs, following the VO-alive guard (see
 [`observer.md`](observer.md)):
 
-| Env | $X_B$ (`bodyPosW("base")`) is |
+| Mode (`useMeasuredBase()`) | $X_B$ (`bodyPosW("base")`) is |
 | --- | --- |
-| Sim (no VO) | the **control** robot's QP-integrated base pose |
-| Real (VO alive) | the **measured** base pose from `realRobot("triorb")`, grounded by the `VisualOdometryObserver` |
+| open-loop (`none`/`joints`), or VO stale | the **control** robot's QP-integrated base pose |
+| closed-loop (`observed`/`observed_real`) + fresh VO | the **measured** base pose from `realRobot("triorb")`, grounded by the `VisualOdometryObserver` |
 
 The base state is written to `realRobots()` by the observer, not into the control
 robot; what you observe/tune in the ticker still matches hardware.
