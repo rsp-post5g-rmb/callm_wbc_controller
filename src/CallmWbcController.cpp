@@ -533,10 +533,13 @@ void CallmWbcController::reset(const mc_control::ControllerResetData & reset_dat
 
   // 1. Initial poses, set BEFORE the coupling contacts are added. The TriOrb root
   // (`world`) stays at the origin; the base is carried by its base_x/base_y/base_yaw
-  // joints. The arm's floating base is placed onto the mount link so that the UR5e
-  // "Base" surface coincides with the runtime-added "ArmMount" surface.
+  // joints. The arm's floating base is planted directly ON the TriOrb `mount` frame,
+  // so the UR5e "Base" surface coincides with the runtime-added "ArmMount" surface and
+  // the URDF (base_to_mount in triorb.urdf: currently Rz(-90deg), z=0.60) is the single
+  // source of truth for the mounting orientation/height. This also composes correctly
+  // with any nonzero base reset pose (unlike a hard-coded world transform).
   robots().robot("triorb").posW(sva::PTransformd::Identity());
-  robots().robot(0).posW(sva::PTransformd(sva::RotZ(0.0), Eigen::Vector3d(0.0, 0.0, mountHeight_)));
+  robots().robot(0).posW(robots().robot("triorb").bodyPosW("mount"));
 
   // 2. Rigid arm<->base attachment (all 6 dof constrained). Added AFTER posW so the
   // contact frame captures the intended relative pose.

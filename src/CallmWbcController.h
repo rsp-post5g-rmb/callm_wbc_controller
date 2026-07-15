@@ -117,9 +117,10 @@ private:
   double gripperPostureWeight_ = 1.0;
 
   // Geometry of the TriOrb description (world Z of the relevant links at the home pose).
-  // base link sits at z = 0.30, mount link at z = 0.60 (see mc_triorb_description/urdf/triorb.urdf).
+  // base link sits at z = 0.30 (see mc_triorb_description/urdf/triorb.urdf). The mount
+  // link pose (z = 0.60, Rz(-90deg)) is read from the model at reset via bodyPosW("mount"),
+  // so it is intentionally not duplicated as a constant here.
   double baseHeight_ = 0.30;
-  double mountHeight_ = 0.60;
 
   // Names of the runtime-added attachment surface on the TriOrb mount link.
   std::string armMountSurface_ = "ArmMount";
