@@ -102,6 +102,8 @@ $d_i$ = interaction distance, $d_s$ = safety distance, $\xi$ = damping.
 
 ## Outside the QP
 
-- State grounding (pre-solve): $\;q_1 \leftarrow (x,y,\theta)_{\mathrm{SLAM}}$.
+- State grounding: the `VisualOdometryObserver` writes $\;q_1 \leftarrow (x,y,\theta)_{\mathrm{VO}}$ into
+  `realRobots()` (+ reconstructs the UR5e floating base from the mount); the control robots take it up
+  via the QP `feedback` mode. See [`observer.md`](observer.md).
 - Output demux (post-solve): arm $\to q_{\mathrm{arm}}$ (position); base $\to \dot q_1$
   (world $\to$ body) $\to$ base plugin; gripper opening $\to$ `RobotiqGripper::setOpening`.

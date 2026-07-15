@@ -25,6 +25,18 @@ std::vector<double> clampNonNeg(std::vector<double> v)
   for(auto & x : v) { x = std::max(0.0, x); }
   return v;
 }
+
+/** Map the `feedback` config string to the QP FeedbackType (how robots() consume realRobots()). */
+mc_solver::FeedbackType parseFeedback(const std::string & s)
+{
+  if(s == "none" || s == "open" || s == "openloop") { return mc_solver::FeedbackType::None; }
+  if(s == "joints") { return mc_solver::FeedbackType::Joints; }
+  if(s == "joints_velocity" || s == "jointsWVelocity") { return mc_solver::FeedbackType::JointsWVelocity; }
+  if(s == "observed" || s == "closed" || s == "closedloop") { return mc_solver::FeedbackType::ObservedRobots; }
+  if(s == "observed_real" || s == "closedLoopIntegrateReal") { return mc_solver::FeedbackType::ClosedLoopIntegrateReal; }
+  mc_rtc::log::warning("[CallmWbcController] unknown feedback '{}'; using open-loop (none)", s);
+  return mc_solver::FeedbackType::None;
+}
 } // namespace
 
 std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn::RobotModulePtr rm,
@@ -133,16 +145,13 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
     r("publish_decimation", publishDecimation_);
   }
 
-  // ---- Base localization (SLAM) + base-velocity export ---------------------
-  if(config.has("base_state"))
-  {
-    auto b = config("base_state");
-    b("from_slam", baseStateFromSlam_);
-    b("slam_topic", slamTopic_);
-    b("slam_frame", slamFrameMode_); // "capture_offset" or "world"
-    b("slam_timeout", slamTimeout_);
-    b("command_key", triorbCmdKey_);
-  }
+  // ---- Base-velocity export key + QP feedback mode --------------------------
+  // Base *state* now comes from the VisualOdometryObserver (realRobots); the controller
+  // only needs the export key here and the feedback mode. See docs/observer.md.
+  if(config.has("base_state")) { config("base_state")("command_key", triorbCmdKey_); }
+  std::string feedback = "none";
+  config("feedback", feedback);
+  feedbackType_ = parseFeedback(feedback);
 
   // ---- Constraints + main-robot posture ------------------------------------
   solver().addConstraintSet(contactConstraint);
@@ -276,10 +285,11 @@ void CallmWbcController::setupTargetsIO()
 
 bool CallmWbcController::run()
 {
-  applyBaseState(); // SLAM pose -> TriOrb base joints (measured state, before the QP)
   applyPendingCommand(); // ROS-buffered command -> datastore (control thread)
   applyCommandsToTasks(); // datastore -> live tasks / gripper
-  bool ok = mc_control::MCController::run(); // QP solves + euler-integrates
+  // QP solves + euler-integrates. feedbackType_ selects how robots() consume realRobots()
+  // (VO base + Encoder joints), grounded by the observer pipeline before this runs.
+  bool ok = mc_control::MCController::run(feedbackType_);
   exportBaseVelocity(); // QP-realized base velocity (body frame) -> TriorbBasePlugin
   if(publishMeasured_ && measuredPublisher_ && (runCounter_ % publishDecimation_ == 0)) { publishMeasured(); }
   ++runCounter_;
@@ -434,11 +444,13 @@ void CallmWbcController::integrateBaseVelocity()
   // Re-base the target off the CURRENT base pose each tick (a one-step-ahead "carrot"),
   // NOT off a persistent accumulator. This keeps the position error bounded at ~v*dt, so
   // the target can never wind up when the base cannot track the command (conflicting
-  // tasks / constraints) and it self-anchors to the SLAM-grounded pose on hardware
-  // (bodyPosW == QP-integrated pose in sim, SLAM pose on real -- same code path).
+  // tasks / constraints). The anchor is the MEASURED base pose (realRobot, updated by the
+  // VisualOdometryObserver this tick) when VO is alive, else the control-robot base (which
+  // moves by QP integration) so pure sim keeps progressing -- see docs/observer.md.
   // Trade-off: the base is velocity-controlled (motion via the refVelB feed-forward);
   // it does NOT catch up on lag. See docs/base_velocity_target.md.
-  const sva::PTransformd Xcur = robots().robot("triorb").bodyPosW("base");
+  const sva::PTransformd Xcur = voAlive() ? realRobot("triorb").bodyPosW("base")
+                                          : robots().robot("triorb").bodyPosW("base");
   const auto & R = Xcur.rotation();
   double yaw = std::atan2(R(0, 1), R(0, 0)); // SVA RotZ convention (planar base)
   const double c = std::cos(yaw), s = std::sin(yaw);
@@ -454,61 +466,11 @@ void CallmWbcController::integrateBaseVelocity()
   baseTask_->refVelB(sva::MotionVecd(Eigen::Vector3d(0.0, 0.0, wz), Eigen::Vector3d(vx, vy, 0.0)));
 }
 
-void CallmWbcController::applyBaseState()
+bool CallmWbcController::voAlive() const
 {
-  if(!baseStateFromSlam_) { return; }
-
-  SlamPose p;
-  {
-    // try_lock: don't stall the control loop on the ROS spin thread.
-    std::unique_lock<std::mutex> lock(slamMutex_, std::try_to_lock);
-    if(!lock.owns_lock()) { return; }
-    p = slamPose_;
-  }
-  if(!p.valid) { return; } // no localization yet -> leave the base model as-is
-
-  // Staleness: hold the last pose but warn once if SLAM has gone quiet.
-  const double age = std::chrono::duration<double>(std::chrono::steady_clock::now() - p.recv).count();
-  if(age > slamTimeout_)
-  {
-    if(!slamStaleWarned_)
-    {
-      mc_rtc::log::warning("[CallmWbcController] SLAM pose stale ({:.2f}s > {:.2f}s); holding last base pose", age,
-                           slamTimeout_);
-      slamStaleWarned_ = true;
-    }
-  }
-  else
-  {
-    slamStaleWarned_ = false;
-  }
-
-  // Express the SLAM pose in the controller world frame.
-  double wx = p.x, wy = p.y, wyaw = p.yaw;
-  if(slamFrameMode_ != "world")
-  {
-    // capture-offset: world = R(-offYaw) * (slam - off), offset grabbed once at reset.
-    if(!slamOffsetCaptured_)
-    {
-      slamOffX_ = p.x;
-      slamOffY_ = p.y;
-      slamOffYaw_ = p.yaw;
-      slamOffsetCaptured_ = true;
-    }
-    const double dx = p.x - slamOffX_, dy = p.y - slamOffY_;
-    const double c = std::cos(slamOffYaw_), s = std::sin(slamOffYaw_);
-    wx = c * dx + s * dy;
-    wy = -s * dx + c * dy;
-    wyaw = std::atan2(std::sin(p.yaw - slamOffYaw_), std::cos(p.yaw - slamOffYaw_)); // wrapped
-  }
-
-  // Overwrite the planar base joints with the measured pose, then refresh FK/velocity.
-  auto & tri = robots().robot("triorb");
-  tri.mbc().q[tri.jointIndexByName("base_x")] = {wx};
-  tri.mbc().q[tri.jointIndexByName("base_y")] = {wy};
-  tri.mbc().q[tri.jointIndexByName("base_yaw")] = {wyaw};
-  tri.forwardKinematics();
-  tri.forwardVelocity();
+  // The VisualOdometryObserver registers this call in its update() once it has applied a
+  // fresh (within-timeout) VO fix to realRobots(). Absent (pure sim / no VO) -> false.
+  return datastore().has("VO::isAlive") && datastore().call<bool>("VO::isAlive");
 }
 
 void CallmWbcController::exportBaseVelocity()
@@ -517,10 +479,14 @@ void CallmWbcController::exportBaseVelocity()
   if(!datastore().has(triorbCmdKey_)) { return; }
 
   auto & tri = robots().robot("triorb");
-  const double xd = tri.mbc().alpha[tri.jointIndexByName("base_x")][0]; // world-frame ẋ
-  const double yd = tri.mbc().alpha[tri.jointIndexByName("base_y")][0]; // world-frame ẏ
-  const double wz = tri.mbc().alpha[tri.jointIndexByName("base_yaw")][0]; // θ̇
-  const double yaw = tri.mbc().q[tri.jointIndexByName("base_yaw")][0]; // == SLAM yaw (grounded above)
+  const double xd = tri.mbc().alpha[tri.jointIndexByName("base_x")][0]; // world-frame ẋ (commanded)
+  const double yd = tri.mbc().alpha[tri.jointIndexByName("base_y")][0]; // world-frame ẏ (commanded)
+  const double wz = tri.mbc().alpha[tri.jointIndexByName("base_yaw")][0]; // θ̇ (commanded)
+  // Rotate the commanded world velocity into the *measured* base body frame the plugin
+  // expects: use realRobot's yaw (VO) when alive, else the control-robot yaw (sim).
+  const double yaw = voAlive()
+                         ? realRobot("triorb").mbc().q[realRobot("triorb").jointIndexByName("base_yaw")][0]
+                         : tri.mbc().q[tri.jointIndexByName("base_yaw")][0];
   const double c = std::cos(yaw), s = std::sin(yaw);
   // world -> body; the plugin is configured with command_in_world_frame: false.
   const Eigen::Vector3d body(c * xd + s * yd, -s * xd + c * yd, wz);
@@ -607,15 +573,6 @@ void CallmWbcController::reset(const mc_control::ControllerResetData & reset_dat
   // Push the seeds onto the freshly created tasks once, so the first run() is consistent.
   applyCommandsToTasks();
 
-  // Re-capture the SLAM->world offset at the start of each episode (the base is at
-  // the world origin here, so the first *post-reset* SLAM pose defines the alignment).
-  slamOffsetCaptured_ = false;
-  slamStaleWarned_ = false;
-  {
-    std::lock_guard<std::mutex> lk(slamMutex_);
-    slamPose_.valid = false; // discard any pre-reset pose; wait for a fresh one
-  }
-
   mc_rtc::log::success("CallmWbcController reset done");
 }
 
@@ -645,14 +602,8 @@ void CallmWbcController::setupRos()
       commandTopic_, rclcpp::QoS(1),
       [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) { handleCommand(msg); }, sub_options);
 
-  if(baseStateFromSlam_)
-  {
-    slamSubscriber_ = rosNode_->create_subscription<geometry_msgs::msg::PoseStamped>(
-        slamTopic_, rclcpp::QoS(1),
-        [this](const geometry_msgs::msg::PoseStamped::SharedPtr msg) { handleSlamPose(msg); }, sub_options);
-    mc_rtc::log::info("[CallmWbcController] base state from SLAM topic '{}' (frame: {})", slamTopic_, slamFrameMode_);
-  }
-
+  // Base localization is no longer subscribed here: the VisualOdometryObserver owns the
+  // VO topic and grounds realRobots() (see docs/observer.md).
   if(publishMeasured_)
   {
     measuredPublisher_ = rosNode_->create_publisher<std_msgs::msg::Float64MultiArray>(measuredTopic_, rclcpp::QoS(1));
@@ -673,7 +624,6 @@ void CallmWbcController::stopRos()
   if(rosSpinThread_.joinable()) { rosSpinThread_.join(); }
   if(rosNode_ && rosExecutor_) { rosExecutor_->remove_node(rosNode_); }
   commandSubscriber_.reset();
-  slamSubscriber_.reset();
   measuredPublisher_.reset();
   rosNode_.reset();
   rosExecutor_.reset();
@@ -697,23 +647,6 @@ void CallmWbcController::handleCommand(const std_msgs::msg::Float64MultiArray::S
   std::lock_guard<std::mutex> lock(commandMutex_);
   commandedData_ = unpacked;
   hasPendingCommand_ = true;
-}
-
-void CallmWbcController::handleSlamPose(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
-{
-  // Planar projection: keep x, y and yaw; drop z / roll / pitch. The orientation is
-  // the base heading in the SLAM map frame (standard ROS active convention).
-  const Eigen::Quaterniond q(msg->pose.orientation.w, msg->pose.orientation.x, msg->pose.orientation.y,
-                             msg->pose.orientation.z);
-  const Eigen::Matrix3d R = q.normalized().toRotationMatrix();
-  const double yaw = std::atan2(R(1, 0), R(0, 0));
-
-  std::lock_guard<std::mutex> lock(slamMutex_);
-  slamPose_.x = msg->pose.position.x;
-  slamPose_.y = msg->pose.position.y;
-  slamPose_.yaw = yaw;
-  slamPose_.recv = std::chrono::steady_clock::now();
-  slamPose_.valid = true;
 }
 
 WbcData CallmWbcController::collectMeasured() const

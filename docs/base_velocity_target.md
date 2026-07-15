@@ -70,15 +70,17 @@ feed-forward; the near-zero position error means the stiffness term barely acts)
 
 ## Sim ↔ real consistency
 
-`integrateBaseVelocity()` is a **single unconditional code path** — no `sim`/`real`
-branch. Only the *source* of $X_B$ differs, and the behavior is identical either way:
+`integrateBaseVelocity()` applies the **same re-base rule** in every case; only the
+*source* of the anchor $X_B$ differs, following the VO-alive guard (see
+[`observer.md`](observer.md)):
 
-| Env | $X_B$ (`bodyPosW("base")`) is | 
+| Env | $X_B$ (`bodyPosW("base")`) is |
 | --- | --- |
-| Sim (no SLAM) | the QP-integrated base pose |
-| Real (SLAM) | the SLAM-grounded base pose (set in `applyBaseState()` pre-solve) |
+| Sim (no VO) | the **control** robot's QP-integrated base pose |
+| Real (VO alive) | the **measured** base pose from `realRobot("triorb")`, grounded by the `VisualOdometryObserver` |
 
-What you observe/tune in the ticker matches hardware.
+The base state is written to `realRobots()` by the observer, not into the control
+robot; what you observe/tune in the ticker still matches hardware.
 
 ## Alternative (not implemented): leash
 

@@ -146,25 +146,29 @@ On the real robot the controller runs under **mc_rtde**, which owns the RT loop 
 drives the **UR5e arm** (position mode). The **base** and **gripper** are mc_rtc
 `GlobalPlugin`s in the same loop (I/O off the RT thread). See `etc/mc_rtde_callm.yaml`.
 
-- **Base state ← SLAM.** The base is velocity-controlled hardware, so its *state*
-  is grounded every tick from a `geometry_msgs/PoseStamped` topic (default
-  `/robot_pose_slam`): `run()` folds `x, y, yaw` into the TriOrb `base_x`/`base_y`/
-  `base_yaw` joints before the QP — the base analogue of mc_rtde feeding the arm
-  encoders back. `base_state.slam_frame` selects `capture_offset` (grab the first
-  SLAM pose at `reset()` as the map→world offset; robust) or `world` (use the pose
-  raw, valid when SLAM zeroes its origin to the robot at each episode start).
-  Stale SLAM (> `slam_timeout`) holds the last pose and warns once.
+- **Base state ← Visual Odometry (observer).** The base is velocity-controlled
+  hardware, so its measured *state* is grounded in `realRobots()` by the
+  **`VisualOdometryObserver`** (a state-observer, not controller code): it subscribes
+  to a `geometry_msgs/PoseStamped` topic (default `/robot_pose_slam`), writes the
+  TriOrb `base_x`/`base_y`/`base_yaw` joints, and reconstructs the UR5e floating base
+  from the `mount` (the arm↔base contact is a QP construct and is **not** resolved for
+  the real robots). An `Encoder` observer fills the arm joints. The controller then
+  consumes `realRobots()` — no VO is ever written into `robots()`. How the control
+  robots take up the estimate is the `feedback` mode (QP `FeedbackType`). See
+  [`docs/observer.md`](docs/observer.md) and the separate `mc_visual_odometry_observer`
+  package.
 - **Base command → TriorbBasePlugin.** After the QP, `run()` exports the
   QP-realized base velocity (`triorb` `mbc().alpha`) rotated into the base body
-  frame (on the SLAM yaw) to the plugin's `Triorb::cmd_velocity` datastore key;
-  the plugin must be configured `command_in_world_frame: false`.
+  frame (on the measured/VO yaw when alive) to the plugin's `Triorb::cmd_velocity`
+  datastore key; the plugin must be configured `command_in_world_frame: false`.
 - **Gripper → RobotiqGripperPlugin** via `RobotiqGripper::setOpening` as before.
 
-With no SLAM publisher and no plugins (pure RViZ sim) all of this is inert: the
+With no VO publisher and no plugins (pure RViZ sim), run with `feedback: none`: the
 base is driven by the in-QP velocity integration and nothing is exported.
 
-The ROS command hand-off and the SLAM read use `try_lock`, so the control loop
-never blocks on the ROS spin thread under mc_rtde's `SCHED_DEADLINE` scheduling.
+The ROS command hand-off uses `try_lock`, and the VO read is in the observer (off the
+control thread), so the control loop never blocks on a ROS spin thread under
+mc_rtde's `SCHED_DEADLINE` scheduling.
 
 Build
 --

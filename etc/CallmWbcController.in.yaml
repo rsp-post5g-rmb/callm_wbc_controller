@@ -78,24 +78,57 @@ ros:
   publish_measured: true
   publish_decimation: 10
 
-# ---- Base state (SLAM) + base-velocity export ------------------------------
-# The base is velocity-controlled hardware: its STATE is grounded every tick from
-# a SLAM pose topic (geometry_msgs/PoseStamped), and the QP-realized base velocity
-# is exported (body frame) to the TriorbBasePlugin via its `command_key`
-# (Triorb::cmd_velocity). Set the plugin's `command_in_world_frame: false` to match.
-#
-#   slam_frame:
-#     "capture_offset" -> grab the first SLAM pose at reset() as the map->world
-#                         offset (robust; works whatever the SLAM map origin is).
-#     "world"          -> use the SLAM pose raw (map == controller world; valid when
-#                         SLAM zeroes its origin to the robot at each episode start).
-# With no SLAM publisher / no TriorbBasePlugin (e.g. pure RViZ sim) both paths are
-# inert and the base is driven by the in-QP velocity integration as before.
+# ---- State observation (Encoder + Visual Odometry) -------------------------
+# The base STATE is grounded in realRobots() by the VisualOdometryObserver (VO), which
+# subscribes to a geometry_msgs/PoseStamped topic and writes the TriOrb planar joints,
+# then reconstructs the UR5e floating base from the mount (the arm<->base contact is a
+# QP construct and is NOT resolved for realRobots). The Encoder observer fills the arm
+# joints. This makes realRobots() fully consistent. See docs/observer.md.
+ObserverPipelines:
+  - name: CallmObservers
+    gui: true
+    log: true
+    observers:
+      - type: VisualOdometry     # triorb base from VO + reconstruct ur5e floating base
+        update: true
+        gui: true
+        # required: false -> load the controller even where the observer library is not
+        # installed (e.g. the isolated smoke test); on hardware/superbuild it loads and
+        # appears in the pipeline summary. A warning is logged if it is missing.
+        required: false
+        robot: triorb
+        topic: "/robot_pose_slam"
+        expected_frame_id: ""    # empty = skip header.frame_id check
+        world_X_map:             # pose of the VO/map frame in the controller world
+          translation: [0.0, 0.0, 0.0]
+          rotation: [0.0, 0.0, 0.0]   # roll, pitch, yaw (rad); this rig zeroes map==world per episode
+        height: 0.0
+        planar: true
+        timeout: 0.5             # s; older than this -> observer fails -> last pose held
+        max_jump: 0.5            # m; larger step accepted (loop closure) but flagged; 0 = off
+        planar_joints: [base_x, base_y, base_yaw]
+        attach:                  # Option 1: reconstruct the arm floating base
+          robot: ur5e
+          mount_body: mount
+      - type: Encoder            # ur5e arm joints from encoders
+        update: true
+
+# How the control robots consume realRobots() each tick (QP FeedbackType):
+#   none           -> open loop (pure sim / no VO): base moves by QP velocity integration
+#   joints         -> arm joints closed from encoders; base untouched
+#   observed       -> full closed loop w.r.t realRobots (hardware); needs VO publishing
+#   observed_real  -> as observed, integrating the real state (forces the v1 zero base vel)
+# Left UNSET here (C++ default = none) so pure sim keeps working and the run config can
+# select it: the merge order is global-config -> this controller yaml -> user config, so a
+# key set here would OVERRIDE the run config. Set `feedback: observed` in your hardware
+# run config (see etc/mc_rtde_callm.yaml), or in your user config, for closed loop.
+# feedback: observed
+
+# ---- Base-velocity export --------------------------------------------------
+# The QP-realized base velocity is exported (body frame) to the TriorbBasePlugin via
+# `command_key`. Set the plugin's `command_in_world_frame: false` to match. With no
+# TriorbBasePlugin (pure RViZ sim) the export is inert.
 base_state:
-  from_slam: true
-  slam_topic: "/robot_pose_slam"
-  slam_frame: world          # this rig zeroes SLAM origin per episode -> map == world
-  slam_timeout: 0.5          # s; hold-last + warn once beyond this
   command_key: "Triorb::cmd_velocity"
 
 # ---- Arm <-> base collision avoidance --------------------------------------

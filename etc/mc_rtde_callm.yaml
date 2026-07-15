@@ -20,11 +20,15 @@ Enabled: CallmWbcController
 # is heavy, so run the controller at 200 Hz over a 1 kHz robot loop.
 Timestep: 0.005
 
-# Feed the UR joint encoders (set by mc_rtde) back into the control robot.
-ObserverPipelines:
-  - name: MainPipeline
-    observers:
-      - type: Encoder
+# State observation is defined by the controller itself (CallmWbcController.yaml,
+# pipeline "CallmObservers": VisualOdometry + Encoder -- see docs/observer.md), which
+# supersedes any pipeline set here, so none is defined in this run config.
+#
+# Feedback mode: how the control robots consume realRobots() each tick. `observed`
+# (full closed loop) is the hardware choice; it needs VO publishing on /robot_pose_slam.
+# It is set HERE (not in the controller yaml) because the controller yaml would override
+# the run config -- see the note in CallmWbcController.yaml.
+feedback: observed
 
 # ---- mc_rtde (Universal Robots) interface ---------------------------------
 RTDE:
@@ -41,8 +45,8 @@ TriorbBasePlugin:
   port: /dev/ttyACM0
   baudrate: 115200
   command_key: "Triorb::cmd_velocity"   # CallmWbcController writes body-frame (vx,vy,wz)
-  command_in_world_frame: false         # controller already exports body frame (on SLAM yaw)
-  robot: ""                             # base state comes from SLAM in the controller,
+  command_in_world_frame: false         # controller already exports body frame (on measured/VO yaw)
+  robot: ""                             # base state comes from the VisualOdometry observer,
   base_sensor: ""                       #   not the plugin's wheel-odometry sensor path
   reset_origin_on_connect: true
   with_gui: true

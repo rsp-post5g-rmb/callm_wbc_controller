@@ -210,28 +210,43 @@ controller.datastore().assign<double>(CallmWbcController::GRIPPER_OPENING_KEY, o
 
 ---
 
-## 7. Base localization (SLAM)
+## 7. Base localization (Visual Odometry observer)
 
 On hardware the base is velocity-controlled, so its **state** is grounded every tick from
 a `geometry_msgs/PoseStamped` topic (default `/robot_pose_slam`) — the base analogue of
-the arm's encoder feedback. Configured under `base_state` in
-[`etc/CallmWbcController.in.yaml`](../etc/CallmWbcController.in.yaml):
+the arm's encoder feedback. This is done by a **state observer** that writes to
+`realRobots()` (not the control robot): the `VisualOdometryObserver`, configured as an
+`ObserverPipelines` entry in [`etc/CallmWbcController.in.yaml`](../etc/CallmWbcController.in.yaml):
 
 ```yaml
-base_state:
-  from_slam: true
-  slam_topic: "/robot_pose_slam"
-  slam_frame: world          # "world" (raw) or "capture_offset"
-  slam_timeout: 0.5          # s; hold-last + warn once beyond this
-  command_key: "Triorb::cmd_velocity"
+ObserverPipelines:
+  - name: CallmObservers
+    observers:
+      - type: VisualOdometry
+        update: true
+        robot: triorb
+        topic: "/robot_pose_slam"
+        world_X_map: { translation: [0,0,0], rotation: [0,0,0] }  # map -> controller world
+        timeout: 0.5
+        attach: { robot: ur5e, mount_body: mount }   # reconstruct the arm floating base
+      - type: Encoder            # arm joints
+        update: true
+
+feedback: none                   # set to `observed` on hardware (closed loop); see mc_rtde_callm.yaml
 ```
 
-- `slam_frame: world` — use the SLAM pose raw. Valid when your SLAM **zeroes its origin
-  to the robot at each episode start** (so its `map` frame == the controller world frame).
-- `slam_frame: capture_offset` — grab the first post-reset SLAM pose as the `map→world`
-  offset. Robust to any SLAM map origin; use this if SLAM is *not* re-zeroed per episode.
+- `world_X_map` identity (default) uses the pose **raw** — valid when your VO **zeroes
+  its origin to the robot at each episode start** (its `map` == the controller world).
+- For a non-zeroed map, set `world_X_map` to the pose of the `map` frame in the world.
+- `feedback` selects how the control robots take up the estimate (QP `FeedbackType`):
+  `none` (sim/open-loop), `observed` (hardware/closed-loop). See
+  [`observer.md`](observer.md) and [`qp_feedback.md`](qp_feedback.md).
 
-Sanity check for `world` mode: right after a reset, `/robot_pose_slam` should read
+Full architecture (control vs real copy, why the arm floating base is reconstructed,
+failure modes) is in [`observer.md`](observer.md). The observer itself is the separate
+`mc_visual_odometry_observer` package.
+
+Sanity check (raw/identity map): right after a reset, `/robot_pose_slam` should read
 ≈ `(0, 0, 0)` with identity orientation (position **and** heading zeroed).
 
 ---
@@ -269,7 +284,7 @@ gripper:      { enable: true, model: Robotiq2f85Gripper }
 | Base doesn't move on hardware | `TriorbBasePlugin` not enabled, wrong serial `port`, or `Triorb::cmd_velocity` not being written (check the plugin is in `Plugins:`) |
 | Gripper doesn't respond | `RobotiqGripperPlugin` not enabled, or the Robotiq URCap socket (`host:63352`) unreachable |
 | Arm flies off toward a bad pose | EE target is **world-frame absolute**; command `measured + delta`, not a raw guess |
-| Base pose drifts / EE misses in the room | SLAM not aligned — check `slam_frame` and that SLAM reads `(0,0,0)` after reset |
+| Base pose drifts / EE misses in the room | VO not aligned — check `world_X_map` and that VO reads `(0,0,0)` after reset; confirm `VisualOdometry` is in the pipeline and `feedback: observed` on hardware |
 | `WbcData size mismatch: expected 20` | client sent the wrong-length array; match the layout in `WbcData.h` |
 | Controller can't keep up at 1 kHz | run the controller slower than the robot loop (`Timestep` a multiple of `RobotTimestep`, e.g. 0.005 / 0.001) |
 

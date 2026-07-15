@@ -3,12 +3,12 @@
 #include <mc_control/mc_controller.h>
 
 #include <mc_solver/KinematicsConstraint.h>
+#include <mc_solver/QPSolver.h>
 #include <mc_tasks/PostureTask.h>
 #include <mc_tasks/SurfaceTransformTask.h>
 #include <mc_tasks/TransformTask.h>
 
 #include <rclcpp/rclcpp.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 
 #include <atomic>
@@ -82,17 +82,16 @@ private:
   /** Advance the base transform-task target by the commanded body velocity (one dt step). */
   void integrateBaseVelocity();
 
-  /** Fold the latest SLAM pose into the TriOrb base joints (measured state, before the QP). */
-  void applyBaseState();
-
   /** Hand the QP-realized base velocity (body frame) to the TriorbBasePlugin, after the QP. */
   void exportBaseVelocity();
+
+  /** True when the VisualOdometryObserver has a fresh base fix (datastore VO::isAlive). */
+  bool voAlive() const;
 
   // ---- ROS2 interface (own context + executor + spin thread) ----------------
   void setupRos();
   void stopRos();
   void handleCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
-  void handleSlamPose(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void publishMeasured();
   WbcData collectMeasured() const;
 
@@ -159,7 +158,6 @@ private:
   rclcpp::Context::SharedPtr rosContext_;
   rclcpp::CallbackGroup::SharedPtr rosCallbackGroup_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr commandSubscriber_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr slamSubscriber_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr measuredPublisher_;
   std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> rosExecutor_;
   std::thread rosSpinThread_;
@@ -169,29 +167,18 @@ private:
   WbcData commandedData_;
   bool hasPendingCommand_ = false;
 
-  // ---- Base localization from SLAM (ROS) ------------------------------------
-  // The base is velocity-controlled hardware; its *state* is grounded every tick
-  // from /robot_pose_slam (drift-corrected), the base analogue of mc_rtde feeding
-  // the arm encoders back. The QP-realized base velocity is exported to the
-  // TriorbBasePlugin (Triorb::cmd_velocity) as the *command*.
-  bool baseStateFromSlam_ = true;
-  std::string slamTopic_ = "/robot_pose_slam";
-  std::string slamFrameMode_ = "capture_offset"; ///< "capture_offset" (default) or "world" (raw)
-  double slamTimeout_ = 0.5; ///< s; warn (once) and hold-last beyond this
+  // ---- Base localization + base-velocity export -----------------------------
+  // The base is velocity-controlled hardware. Its measured *state* is grounded in
+  // realRobots() by the VisualOdometryObserver (see docs/observer.md); the controller
+  // consumes that estimate (re-base anchor / export yaw when VO is alive, and via the
+  // QP feedback mode). The QP-realized base velocity is exported to the TriorbBasePlugin
+  // (Triorb::cmd_velocity) as the *command*.
   std::string triorbCmdKey_ = "Triorb::cmd_velocity"; ///< TriorbBasePlugin body-velocity input
 
-  struct SlamPose
-  {
-    double x = 0.0, y = 0.0, yaw = 0.0;
-    std::chrono::steady_clock::time_point recv{};
-    bool valid = false;
-  };
-  mutable std::mutex slamMutex_;
-  SlamPose slamPose_; ///< latest SLAM pose (spin thread -> control thread)
-  // Capture-offset state (control-thread only): world = R(-offYaw)*(slam - off).
-  bool slamOffsetCaptured_ = false;
-  double slamOffX_ = 0.0, slamOffY_ = 0.0, slamOffYaw_ = 0.0;
-  bool slamStaleWarned_ = false;
+  // QP feedback mode: how the control robots consume realRobots() each tick. Set via the
+  // `feedback` config key (none|joints|joints_velocity|observed|observed_real). Default
+  // open-loop so pure sim (no VO publisher) keeps working; use `observed` on hardware.
+  mc_solver::FeedbackType feedbackType_ = mc_solver::FeedbackType::None;
 
   bool weightsDegenerateWarned_ = false; ///< one-shot warn on a degenerate (no arm authority) weight set
 
