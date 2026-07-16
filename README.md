@@ -74,7 +74,7 @@ carries all fields every message:
 | Field | Size | Active? | Destination |
 | --- | --- | --- | --- |
 | `eef_pos` | 3 | yes | arm EE `SurfaceTransformTask` target (position) |
-| `eef_quat` | 4 (w,x,y,z) | yes | arm EE `SurfaceTransformTask` target (orientation) |
+| `eef_quat` | 4 (w,x,y,z) | yes | arm EE `SurfaceTransformTask` target orientation — **standard ROS/Hamilton** (tf2/RViz), world frame |
 | `posture_arm` | 6 | yes | arm `PostureTask` target |
 | `posture_base` | 3 | yes | TriOrb `PostureTask` target (joint-space base command) |
 | `gripper_opening` | 1 | yes | `RobotiqGripper::setOpening` (0 = open, 1 = closed) |
@@ -112,6 +112,15 @@ feed-forward (`refVelB`). The absolute base-pose path (`BASE_TARGET_KEY` / the
 GUI *Base target [world]* marker) is kept as an inactive/overridable alternative,
 selected with `base_command.mode: pose`. Exactly one path drives the base, so the
 two never fight in the QP.
+
+**Rotation convention.** Every rotation that crosses the ROS wire is **standard
+ROS/Hamilton** (the same as tf2, RViz, `geometry_msgs`): `eef_quat` is the active
+orientation of the Tool in world, so `(0.707,0.707,0,0)` is a real +90° about X.
+Internally mc_rtc / SpaceVecAlg store the transposed *frame* rotation, so the wire↔pose
+conversion transposes at exactly one boundary — the `poseFromWire()` / `wireQuat()`
+helpers in `CallmWbcController.cpp` (and the same transpose the `VisualOdometryObserver`
+applies to the VO pose). Route any new pose I/O through those helpers. (The `world_X_map`
+observer YAML uses mc_rtc's `rpyToMat` rpy convention, as befits an mc_rtc config field.)
 
 Commanding it
 --

@@ -38,7 +38,7 @@
  *
  * Field layout inside the flat array (32 doubles total):
  *   [ 0.. 3) eef_pos            (x, y, z)                        world frame
- *   [ 3.. 7) eef_quat           (w, x, y, z)                     world frame
+ *   [ 3.. 7) eef_quat           (w, x, y, z)   world frame, standard ROS/Hamilton (tf2/RViz)
  *   [ 7..13) posture_arm        (6 UR5e joints, ref_joint_order)
  *   [13..16) posture_base       (base_x, base_y, base_yaw)
  *   [16..17) gripper_opening    (0 = open, 1 = closed)           Robotiq convention
@@ -50,7 +50,7 @@
 struct WbcData
 {
   std::array<double, 3> eef_pos = {0.0, 0.0, 0.0};
-  std::array<double, 4> eef_quat = {1.0, 0.0, 0.0, 0.0}; ///< (w, x, y, z)
+  std::array<double, 4> eef_quat = {1.0, 0.0, 0.0, 0.0}; ///< (w,x,y,z) world, standard ROS/Hamilton
   std::array<double, 6> posture_arm = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   std::array<double, 3> posture_base = {0.0, 0.0, 0.0}; ///< plumbed only (extension point)
   double gripper_opening = 0.0; ///< 0 = open, 1 = closed (Robotiq plugin convention)

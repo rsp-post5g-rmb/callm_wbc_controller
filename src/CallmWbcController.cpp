@@ -37,6 +37,26 @@ mc_solver::FeedbackType parseFeedback(const std::string & s)
   mc_rtc::log::warning("[CallmWbcController] unknown feedback '{}'; using open-loop (none)", s);
   return mc_solver::FeedbackType::None;
 }
+
+// Wire<->pose rotation boundary. Wire quaternions are standard ROS/Hamilton (active,
+// tf2/RViz); sva::PTransformd stores the transposed frame rotation. Transpose here only.
+
+/** World PTransformd from a wire Hamilton quaternion (w,x,y,z) + position. */
+sva::PTransformd poseFromWire(const std::array<double, 4> & wxyz, const std::array<double, 3> & xyz)
+{
+  Eigen::Quaterniond q(wxyz[0], wxyz[1], wxyz[2], wxyz[3]);
+  if(q.norm() < 1e-9) { q = Eigen::Quaterniond::Identity(); }
+  q.normalize();
+  const Eigen::Matrix3d E = q.toRotationMatrix().transpose();
+  return sva::PTransformd(E, Eigen::Vector3d(xyz[0], xyz[1], xyz[2]));
+}
+
+/** Wire Hamilton quaternion (w,x,y,z) of a world PTransformd's orientation. */
+std::array<double, 4> wireQuat(const sva::PTransformd & X)
+{
+  const Eigen::Quaterniond q(X.rotation().transpose());
+  return {q.w(), q.x(), q.y(), q.z()};
+}
 } // namespace
 
 std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn::RobotModulePtr rm,
@@ -309,14 +329,8 @@ void CallmWbcController::applyPendingCommand()
     hasPendingCommand_ = false;
   }
 
-  // Arm end-effector SE3 target (world). The wire quaternion is the SVA-frame
-  // rotation, matching the reference explicit_compliance_controller round-trip.
-  Eigen::Quaterniond q(cmd.eef_quat[0], cmd.eef_quat[1], cmd.eef_quat[2], cmd.eef_quat[3]);
-  if(q.norm() < 1e-9) { q = Eigen::Quaterniond::Identity(); }
-  q.normalize();
-  sva::PTransformd eePose(q.toRotationMatrix(),
-                          Eigen::Vector3d(cmd.eef_pos[0], cmd.eef_pos[1], cmd.eef_pos[2]));
-  datastore().assign<sva::PTransformd>(EE_TARGET_KEY, eePose);
+  // Arm EE target: Tool pose in world (Hamilton quat, transposed in poseFromWire).
+  datastore().assign<sva::PTransformd>(EE_TARGET_KEY, poseFromWire(cmd.eef_quat, cmd.eef_pos));
 
   datastore().assign<std::vector<double>>(ARM_POSTURE_KEY,
                                           std::vector<double>(cmd.posture_arm.begin(), cmd.posture_arm.end()));
@@ -666,9 +680,8 @@ WbcData CallmWbcController::collectMeasured() const
   WbcData m;
   const auto & ur5e = robots().robot("ur5e");
   const sva::PTransformd toolPose = ur5e.surfacePose("Tool");
-  const Eigen::Quaterniond quat(toolPose.rotation());
   m.eef_pos = {toolPose.translation().x(), toolPose.translation().y(), toolPose.translation().z()};
-  m.eef_quat = {quat.w(), quat.x(), quat.y(), quat.z()};
+  m.eef_quat = wireQuat(toolPose); // standard ROS/Hamilton (see wireQuat)
   for(size_t i = 0; i < armJointNames_.size(); ++i)
   {
     m.posture_arm[i] = ur5e.mbc().q[ur5e.jointIndexByName(armJointNames_[i])][0];
