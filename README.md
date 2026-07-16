@@ -119,8 +119,9 @@ orientation of the Tool in world, so `(0.707,0.707,0,0)` is a real +90° about X
 Internally mc_rtc / SpaceVecAlg store the transposed *frame* rotation, so the wire↔pose
 conversion transposes at exactly one boundary — the `poseFromWire()` / `wireQuat()`
 helpers in `CallmWbcController.cpp` (and the same transpose the `VisualOdometryObserver`
-applies to the VO pose). Route any new pose I/O through those helpers. (The `world_X_map`
-observer YAML uses mc_rtc's `rpyToMat` rpy convention, as befits an mc_rtc config field.)
+applies to the VO pose). Route any new pose I/O through those helpers. One caveat: the RViz
+*"EE target [world]"* **numeric** field is mc_rtc's raw sva-frame quaternion (the conjugate)
+— details and the type-in workaround are in [`docs/rotation_conventions.md`](docs/rotation_conventions.md).
 
 Commanding it
 --
