@@ -209,10 +209,29 @@ because those seed their target from the current pose.
 - `this_body = "mount"` — a real link (`mc_triorb_description/urdf/triorb.urdf:75`,
   at z=0.60 with Rz(-90°) via `base_to_mount`).
 - `other_body = "base_link"` — the UR5e root link.
-- `prefix = ""` — no collisions to avoid. triorb bodies are
-  `{odom, base_x_link, base_y_link, base_yaw_link, base, mount}` and joints
-  `{base_x, base_y, base_yaw, base_mount_joint, base_to_mount}`; UR5e uses
-  `{base_link, shoulder_link, ..., tool0}` / `{shoulder_pan_joint, ...}`. Disjoint.
+- `prefix = ""` — so the arm's joints, `tool0` and the `Tool` surface keep their names
+  (`armJointNames_`, the EE task and the gripper mount all depend on that). The two
+  modules' **joints** are genuinely disjoint:
+  `{base_x, base_y, base_yaw, base_mount_joint, base_to_mount}` vs
+  `{shoulder_pan_joint, …, base_link-base_link_inertia, base_link-base_fixed_joint,
+  wrist_3-flange, flange-tool0}`.
+- `bodyMapping({{"base", "ur5e_base"}})` — **required.** The **bodies** are *not*
+  disjoint. `ur_description` defines a link literally named `base` (the ROS-Industrial
+  base frame: a −π rotation of `base_link` via `base_link-base_fixed_joint`), and the
+  TriOrb's box link is also named `base`. Without the remap, `connect()` aborts the
+  process with `std::domain_error: Body name: base already exists` from
+  `mbg.addBody` (`RobotModule_connect.cpp:134`).
+
+  Remapping the *arm's* one is safe and is the right side to move: it is unused here (we
+  mount on `base_link`), whereas the TriOrb's `base` is load-bearing — it names the
+  `TransformTask`, the `bodyPosW("base")` reads, and the auto-generated `sch::S_Box`
+  convex that arm↔base collision avoidance targets. Since `triorb` is `this`, its names
+  are never touched by `connect()` (only `other`'s are), so `base` keeps meaning the
+  TriOrb base throughout the controller.
+
+  Full body lists — triorb: `{odom, base_x_link, base_y_link, base_yaw_link, base, mount}`;
+  ur5e: `{base_link, base_link_inertia, shoulder_link, upper_arm_link, forearm_link,
+  wrist_1_link, wrist_2_link, wrist_3_link, base, flange, tool0}`. Intersection: `{base}`.
 - both transforms identity — reproduces exactly today's
   `robot(0).posW(robot("triorb").bodyPosW("mount"))` plus coincident `ArmMount`/`Base`
   planar surfaces (both `PTransformd::Identity()`).
@@ -221,8 +240,8 @@ because those seed their target from the current pose.
 
 Merged rjo = `[base_x, base_y, base_yaw] + [6 UR5e joints]` = **9 entries**.
 
-**Gripper onto tool** — `merged.connect(*gm, "tool0", <base link>, "", params)`, following
-`mc_kinova`'s `attachTool` shape (`module.cpp:112-114`), with
+**Gripper onto tool** — `merged.connect(*gm, "tool0", <base link>, "gripper_", params)`,
+following `mc_kinova`'s `attachTool` shape (`module.cpp:112-114`), with
 `X_other_connection(RotZ(M_PI))`.
 
 `RotZ(M_PI)` is exactly `RobotiqGripperRobotModule::defaultMountingTransform()`
@@ -236,14 +255,29 @@ we would be adding one for two compile-time constants.
 `RotZ(M_PI)` is an involution (its own inverse), so `X_other_connection(RotZ(pi))`
 reproduces today's `posW(RotZ(pi) * toolPose)` exactly.
 
-**Surface mapping is required here.** The gripper's RSDF declares
+**Why a prefix here but not for the arm.** The gripper's links come from
+`robotiq_description`'s xacro macro
+(`mc_robot_tools/robotiq_gripper/xacro/robotiq_2f_85_gripper.urdf.xacro:8`), resolved at
+build time and **not inspectable from this repo** — so, unlike the arm, its body/joint
+names cannot be enumerated here to prove they do not clash. A prefix makes a clash
+impossible whatever they are. This is the cheap insurance the arm connect did not buy,
+and `ur_description`'s `base` is exactly why it should have.
+
+The prefix also fixes a second, quieter problem for free: the gripper's RSDF declares
 `<planar_surface name="Base" ...>`
 (`mc_robot_tools/robotiq_gripper/rsdf/robotiq_2f_85_gripper.rsdf:3`) — the same surface
 name as the UR5e's (`mc_ur5e_description/rsdf/ur5e/base_link.rsdf:6`). Unlike convex
-hulls and sensors, `connect()` does **not** check surface-name collisions, so this
-would silently clobber. We pass
-`.surfaceMapping({{"Base", "GripperBase"}})` (`RobotModule.h:372`) to rename only the
-surface, leaving bodies/joints unprefixed.
+hulls and sensors, `connect()` does **not** check surface-name collisions, so it would
+silently clobber; the prefix renames it to `gripper_Base`.
+
+Affordable because nothing downstream hardcodes the gripper's names: the posture task's
+joints are **derived from the merged model** in the constructor (actuated joints that are
+neither arm nor base), and the command path goes through the mc_robotiq plugin rather
+than the model. The arm cannot do this — `armJointNames_`, `tool0` and `Tool` are
+referenced by name all over the controller.
+
+Note `other_body` is passed **unprefixed**: `connect()` applies the prefix itself when it
+resolves the body (`RobotModule_connect.cpp:168`).
 
 ## 7. mc_rtde implications (flagged, OUT OF SCOPE)
 

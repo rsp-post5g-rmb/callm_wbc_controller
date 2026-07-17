@@ -139,10 +139,9 @@ private:
   //  - gripperCommandEnabled_ : forward gripper_opening to the mc_robotiq plugin (real gripper).
   // The command path does NOT require the model, so the real gripper can be driven with
   // no mc_robot_tools model connected (gripper.simulate=false, gripper.command=true).
-  bool gripperEnabled_ = true; ///< set from robot().hasBody(gripperBaseLink_) (model connected in)
+  bool gripperEnabled_ = true; ///< set from gripperJointNames_ being non-empty (model connected in)
   bool gripperCommandEnabled_ = true; ///< forward opening to RobotiqGripper::setOpening
   std::string gripperModule_ = "Robotiq2f85Gripper"; ///< RobotLoader name (mc_robot_tools)
-  std::string gripperBaseLink_ = "robotiq_85_base_link"; ///< gripper base link in the merged robot
   std::string gripperSetOpeningCall_ = "RobotiqGripper::setOpening"; ///< mc_robotiq datastore call
 
   // Joint orders (verified against the module ref_joint_order). connect() is given an

@@ -94,11 +94,20 @@ std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn:
   // The default connection joint is Fixed (dof 0), so it is NOT appended to the merged
   // ref_joint_order: rjo = [base_x, base_y, base_yaw] + [6 UR5e joints].
   //
-  // An empty prefix is safe: triorb bodies/joints and UR5e bodies/joints are disjoint.
+  // The prefix is empty because we want the arm's joints and `tool0`/`Tool` to keep their
+  // names (armJointNames_, the EE task and the gripper mount all depend on that), and the
+  // two modules' joints are in fact disjoint. Their BODIES are not: ur_description defines
+  // a link literally called `base` -- the ROS-Industrial base frame, a -pi rotation of
+  // `base_link` (joint `base_link-base_fixed_joint`) -- and the TriOrb's box link is also
+  // called `base`. connect() throws "Body name: base already exists" on that clash, so the
+  // arm's one is remapped. It is unused here: we mount on `base_link` and the `base` convex
+  // that arm<->base collision avoidance targets is the TriOrb's box.
+  //
   // `other`'s root joint is dropped by connect(), so passing the UR5eFloatingBase variant
   // is fine -- its floating base is eliminated.
   auto merged = triorb->connect(*rm, "mount", "base_link", "",
-                                mc_rbdyn::RobotModule::ConnectionParameters{}.name(mergedName));
+                                mc_rbdyn::RobotModule::ConnectionParameters{}.name(mergedName).bodyMapping(
+                                    {{"base", "ur5e_base"}}));
 
   // 2. Gripper onto the tool (optional). `gripper.simulate` controls loading this MODEL
   // only; commanding the real gripper goes through the mc_robotiq plugin
@@ -121,7 +130,7 @@ std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn:
       if(gm)
       {
         // Same shape as mc_kinova's attachTool (mc_kinova/src/module.cpp:112-114):
-        // parent.connect(tool, parent_frame, tool.baseFrame(), "", X_other_connection(
+        // parent.connect(tool, parent_frame, tool.baseFrame(), prefix, X_other_connection(
         // tool.defaultMountingTransform())). We inline the two constants instead of
         // linking mc_robot_tools for ConnectableRobotModule, because this package keeps
         // robot modules as runtime plugins rather than link-time dependencies (see
@@ -130,17 +139,27 @@ std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn:
         // "<prefix>_base_link" (:21-24) and defaultMountingTransform() is RotZ(pi) (:37-40).
         // RotZ(pi) is its own inverse, so this reproduces the old posW(RotZ(pi) * toolPose).
         //
-        // surfaceMapping is REQUIRED: the gripper's rsdf declares a planar surface also
-        // named "Base" (robotiq_2f_85_gripper.rsdf), which would silently clobber the
-        // UR5e's "Base" surface -- connect() validates convex/sensor/gripper/device name
-        // collisions but NOT surface ones.
+        // Unlike the arm, this connect takes a NON-EMPTY prefix. The gripper's links come
+        // from robotiq_description's xacro macro, which is resolved at build time and is
+        // not inspectable from this repo, so we cannot enumerate its body/joint names to
+        // prove they do not clash (the arm taught us that lesson: ur_description's `base`).
+        // A prefix makes a clash impossible whatever they turn out to be, and it also
+        // renames the gripper's rsdf surface -- which IS named "Base", the same as the
+        // UR5e's, and which connect() would silently clobber since it validates
+        // convex/sensor/gripper/device name collisions but NOT surface ones.
+        //
+        // Nothing downstream hardcodes the gripper's names: the posture task's joints are
+        // derived from the merged model in the constructor, and the command path goes
+        // through the mc_robotiq plugin, not the model.
+        //
+        // `other_body` is given UNPREFIXED here -- connect() applies the prefix itself when
+        // it looks the body up (RobotModule_connect.cpp:168).
         const bool is140 = gripperModule.find("140") != std::string::npos;
         const std::string gBaseLink = is140 ? "robotiq_140_base_link" : "robotiq_85_base_link";
-        merged = merged.connect(*gm, "tool0", gBaseLink, "",
+        merged = merged.connect(*gm, "tool0", gBaseLink, "gripper_",
                                 mc_rbdyn::RobotModule::ConnectionParameters{}
                                     .name(mergedName)
-                                    .X_other_connection(sva::PTransformd(sva::RotZ(M_PI)))
-                                    .surfaceMapping({{"Base", "GripperBase"}}));
+                                    .X_other_connection(sva::PTransformd(sva::RotZ(M_PI))));
       }
       else
       {
@@ -192,34 +211,22 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
     g("set_opening_call", gripperSetOpeningCall_);
     g("command", gripperCommandEnabled_); // forward opening to the mc_robotiq plugin (real gripper)
   }
-  const bool is140 = gripperModule_.find("140") != std::string::npos;
-  gripperBaseLink_ = is140 ? "robotiq_140_base_link" : "robotiq_85_base_link";
   // The gripper is no longer a separate robot: robotModules() connects it into the merged
-  // module, so "is the model loaded" is now "does the merged robot carry the gripper base
-  // link". The command path (mc_robotiq plugin) stays independent of this.
-  gripperEnabled_ = robot().hasBody(gripperBaseLink_);
-
-  // The gripper joints are whatever the merged robot has that is neither an arm nor a base
-  // joint -- derived from the model rather than hardcoded, so mimic/knuckle naming stays an
-  // implementation detail of the gripper module. Used for the posture task joint selector.
-  if(gripperEnabled_)
+  // module. Detect it from the joints rather than from a body name, so nothing here depends
+  // on robotiq_description's naming or on the prefix robotModules() chose: the gripper's
+  // joints are simply the merged robot's actuated joints that are neither arm nor base.
+  // That also covers the mimic/knuckle joints without enumerating them.
+  //
+  // The command path (mc_robotiq plugin) stays independent of all this.
+  for(const auto & j : robot().mb().joints())
   {
-    for(const auto & j : robot().mb().joints())
-    {
-      if(j.dof() == 0) { continue; }
-      const auto & n = j.name();
-      const bool isArm = std::find(armJointNames_.begin(), armJointNames_.end(), n) != armJointNames_.end();
-      const bool isBase = std::find(baseJointNames_.begin(), baseJointNames_.end(), n) != baseJointNames_.end();
-      if(!isArm && !isBase) { gripperJointNames_.push_back(n); }
-    }
-    if(gripperJointNames_.empty())
-    {
-      mc_rtc::log::warning("[CallmWbcController] gripper base link '{}' is present but it has no actuated joints; "
-                           "no gripper posture task will be created",
-                           gripperBaseLink_);
-      gripperEnabled_ = false;
-    }
+    if(j.dof() == 0) { continue; } // fixed joints, including the connect joints
+    const auto & n = j.name();
+    const bool isArm = std::find(armJointNames_.begin(), armJointNames_.end(), n) != armJointNames_.end();
+    const bool isBase = std::find(baseJointNames_.begin(), baseJointNames_.end(), n) != baseJointNames_.end();
+    if(!isArm && !isBase) { gripperJointNames_.push_back(n); }
   }
+  gripperEnabled_ = !gripperJointNames_.empty(); // model connected in (independent of command)
 
   // ---- ROS interface options -----------------------------------------------
   if(config.has("ros"))
@@ -290,8 +297,10 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   setupTargetsIO();
   setupRos();
 
-  mc_rtc::log::success("CallmWbcController init done (merged robot: {}, gripper model: {}, command: {})", robot().name(),
-                       gripperEnabled_ ? gripperBaseLink_ : "not simulated", gripperCommandEnabled_ ? "on" : "off");
+  mc_rtc::log::success("CallmWbcController init done (merged robot: {}, {} dof; gripper model: {}, command: {})",
+                       robot().name(), robot().mb().nrDof(),
+                       gripperEnabled_ ? fmt::format("{} joints", gripperJointNames_.size()) : "not simulated",
+                       gripperCommandEnabled_ ? "on" : "off");
 }
 
 CallmWbcController::~CallmWbcController()
