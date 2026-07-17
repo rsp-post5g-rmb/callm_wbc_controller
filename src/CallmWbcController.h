@@ -2,7 +2,6 @@
 
 #include <mc_control/mc_controller.h>
 
-#include <mc_solver/KinematicsConstraint.h>
 #include <mc_solver/QPSolver.h>
 #include <mc_tasks/PostureTask.h>
 #include <mc_tasks/SurfaceTransformTask.h>
@@ -25,16 +24,20 @@
 /** Whole-body controller for a UR5e arm mounted on a TriOrb omnidirectional base.
  *
  * A single QP coordinates the arm joints and the base planar motion jointly:
- *   - robot 0: UR5e (floating base, `MainRobot: UR5eFloatingBase`)
- *   - robot 1: triorb (the TriOrb base)
- *   - robot 2: env/ground (visualization only)
- *   - robot 3: robotiq_2f_85_gripper (rigidly bolted onto the UR5e tool)
+ *   - robot 0: callm -- the TriOrb base, the UR5e arm and (optionally) the Robotiq
+ *              gripper fused into ONE robot module by mc_rbdyn::RobotModule::connect
+ *   - robot 1: env/ground (visualization only)
  *
- * The UR5e floating base is rigidly attached to the TriOrb `mount` link through a
- * Base<->Base contact, so when the QP moves the base the arm follows, and when the
- * end-effector task pulls the hand the solver distributes the motion across both the
- * arm joints and the base degrees of freedom. That is the whole-body coordination,
- * with no explicit inverse kinematics.
+ * The arm is bolted to the TriOrb `mount` link and the gripper to the arm's `tool0` by
+ * fixed CONNECT JOINTS, not by contacts: robotModules() merges the three modules before
+ * MCController loads them, so the QP sees a single kinematic tree from `odom` through
+ * base_x/base_y/base_yaw to the fingertips. When the end-effector task pulls the hand the
+ * solver distributes the motion across the arm joints and the base degrees of freedom.
+ * That is the whole-body coordination, with no explicit inverse kinematics.
+ *
+ * The attachment is therefore structural: there is no coupling constraint to maintain, no
+ * contact frame to capture, and the QP runs with NO contacts at all. See
+ * docs/connect_migration.md for the migration rationale and the API evidence.
  *
  * Commands arrive from a ROS2 client as a WbcData message (see WbcData.h). The ROS
  * node spins on its own thread and hands the latest command to the control loop
@@ -100,13 +103,14 @@ private:
   void publishMeasured();
   WbcData collectMeasured() const;
 
-  // WBC tasks / constraints
-  std::shared_ptr<mc_tasks::SurfaceTransformTask> eeTask_; ///< UR5e end-effector (Tool surface)
-  std::shared_ptr<mc_tasks::TransformTask> baseTask_; ///< TriOrb base body pose
-  std::shared_ptr<mc_tasks::PostureTask> triorbPostureTask_; ///< regularizes the base joints
-  std::unique_ptr<mc_solver::KinematicsConstraint> triorbKinematics_; ///< base joint limits
-  std::shared_ptr<mc_tasks::PostureTask> gripperPostureTask_; ///< holds the gripper knuckle joints
-  std::unique_ptr<mc_solver::KinematicsConstraint> gripperKinematics_; ///< gripper joint limits
+  // WBC tasks. All of them address the merged robot (index 0); the posture tasks are
+  // restricted to disjoint joint sets with selectActiveJoints. Joint limits for every
+  // joint come from mc_rtc's built-in robot-0 kinematicsConstraint, so there are no
+  // per-part KinematicsConstraints any more.
+  std::shared_ptr<mc_tasks::SurfaceTransformTask> eeTask_; ///< arm end-effector (Tool surface)
+  std::shared_ptr<mc_tasks::TransformTask> baseTask_; ///< base body pose
+  std::shared_ptr<mc_tasks::PostureTask> triorbPostureTask_; ///< regularizes the base joints only
+  std::shared_ptr<mc_tasks::PostureTask> gripperPostureTask_; ///< holds the gripper knuckle joints only
 
   // Task gains / weights (loaded from the controller configuration)
   double eeStiffness_ = 5.0;
@@ -122,34 +126,33 @@ private:
 
   // Geometry of the TriOrb description (world Z of the relevant links at the home pose).
   // base link sits at z = 0.30 (see mc_triorb_description/urdf/triorb.urdf). The mount
-  // link pose (z = 0.60, Rz(-90deg)) is read from the model at reset via bodyPosW("mount"),
-  // so it is intentionally not duplicated as a constant here.
+  // link pose (z = 0.60, Rz(-90deg)) is baked into the merged module by connect(), so it
+  // is intentionally not duplicated as a constant here.
   double baseHeight_ = 0.30;
-
-  // Names of the runtime-added attachment surface on the TriOrb mount link.
-  std::string armMountSurface_ = "ArmMount";
 
   // Base command routing: "velocity" (active, from velocity_base) or "pose" (inactive path).
   std::string baseCommandMode_ = "velocity";
   sva::PTransformd baseTargetPose_ = sva::PTransformd::Identity(); ///< integrated base setpoint
 
   // Robotiq gripper. Two independent switches:
-  //  - gripperEnabled_ : the gripper MODEL is loaded + attached (simulation/visualization).
+  //  - gripperEnabled_ : the gripper MODEL is connected into the merged robot (sim/viz).
   //  - gripperCommandEnabled_ : forward gripper_opening to the mc_robotiq plugin (real gripper).
   // The command path does NOT require the model, so the real gripper can be driven with
-  // no mc_robot_tools model loaded (gripper.simulate=false, gripper.command=true).
-  bool gripperEnabled_ = true; ///< set from robots().hasRobot(gripperRobot_) (model loaded)
+  // no mc_robot_tools model connected (gripper.simulate=false, gripper.command=true).
+  bool gripperEnabled_ = true; ///< set from robot().hasBody(gripperBaseLink_) (model connected in)
   bool gripperCommandEnabled_ = true; ///< forward opening to RobotiqGripper::setOpening
   std::string gripperModule_ = "Robotiq2f85Gripper"; ///< RobotLoader name (mc_robot_tools)
-  std::string gripperRobot_ = "robotiq_2f_85_gripper"; ///< robot name = module name
-  std::string gripperBaseSurface_ = "Base"; ///< planar surface on the gripper base link
-  std::string gripperBaseLink_ = "robotiq_85_base_link"; ///< base link for the runtime attachment surface
+  std::string gripperBaseLink_ = "robotiq_85_base_link"; ///< gripper base link in the merged robot
   std::string gripperSetOpeningCall_ = "RobotiqGripper::setOpening"; ///< mc_robotiq datastore call
 
-  // Joint orders (verified against the module ref_joint_order).
+  // Joint orders (verified against the module ref_joint_order). connect() is given an
+  // empty prefix, so the arm and base joints keep these names in the merged robot.
   std::vector<std::string> armJointNames_ = {"shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
                                              "wrist_1_joint",       "wrist_2_joint",       "wrist_3_joint"};
   std::vector<std::string> baseJointNames_ = {"base_x", "base_y", "base_yaw"};
+  /// Actuated joints of the connected gripper, derived from the merged model in the
+  /// constructor (everything actuated that is neither an arm nor a base joint).
+  std::vector<std::string> gripperJointNames_;
 
   // ROS2 plumbing (mirrors explicit_compliance_controller).
   std::string rosNodeName_ = "callm_wbc_controller";

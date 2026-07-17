@@ -5,7 +5,7 @@ base is commanded by **velocity** (`velocity_base`, active path).
 
 ## Setup
 
-- $X_B$ — current base body pose, `robots("triorb").bodyPosW("base")`.
+- $X_B$ — current base body pose, `robot().bodyPosW("base")`.
 - $V_b = (v_x,\,v_y,\,\omega)$ — commanded body-frame velocity (`BASE_VELOCITY_KEY`).
 - $X^\star$ — the base task target; the task also gets the feed-forward `refVelB` $= V_b$.
 - $\Delta t$ — control timestep.
@@ -77,7 +77,7 @@ feed-forward; the near-zero position error means the stiffness term barely acts)
 | Mode (`useMeasuredBase()`) | $X_B$ (`bodyPosW("base")`) is |
 | --- | --- |
 | open-loop (`none`/`joints`), or VO stale | the **control** robot's QP-integrated base pose |
-| closed-loop (`observed`/`observed_real`) + fresh VO | the **measured** base pose from `realRobot("triorb")`, grounded by the `VisualOdometryObserver` |
+| closed-loop (`observed`/`observed_real`) + fresh VO | the **measured** base pose from `realRobot()` (the merged robot), grounded by the `VisualOdometryObserver` |
 
 The base state is written to `realRobots()` by the observer, not into the control
 robot; what you observe/tune in the ticker still matches hardware.

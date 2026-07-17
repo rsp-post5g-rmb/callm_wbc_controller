@@ -6,25 +6,40 @@
 # they only take effect from the global mc_rtc.yaml used to launch the framework,
 # so make sure your run-time mc_rtc.yaml mirrors them:
 #
-#   MainRobot: UR5eFloatingBase
+#   MainRobot: UR5e
 #   Enabled: CallmWbcController
 #
-MainRobot: UR5eFloatingBase
+# NOTE: MainRobot is the ARM module only. The controller does not use it directly as
+# robot 0: robotModules() connects it onto the TriOrb base (and the gripper onto its
+# tool) and hands MCController the merged module instead. See docs/connect_migration.md.
+# The fixed `UR5e` variant is the honest choice now -- the arm has no floating base once
+# it is bolted on -- but `UR5eFloatingBase` also works, since connect() drops the root
+# joint of the module it attaches.
+MainRobot: UR5e
 Enabled: CallmWbcController
 
+# ---- Robot assembly (connect) ----------------------------------------------
+# Name of the merged robot module (TriOrb base + UR5e arm [+ Robotiq gripper]). This is
+# the name of robot 0, so it is what the observer's `robot:` key and any interface config
+# (e.g. mc_rtde's RTDE block) must refer to.
+connect:
+  name: callm
+
 # ---- Whole-body task gains -------------------------------------------------
-# Arm end-effector task (UR5e "Tool" surface, robot 0).
+# Arm end-effector task ("Tool" surface of the merged robot).
 ee_task:
   stiffness: 5.0
   weight: 1000.0
 
-# Base command task (TriOrb "base" body, robot 1). Drives base_x / base_y /
+# Base command task ("base" body of the merged robot). Drives base_x / base_y /
 # base_yaw to reach the commanded planar pose.
 base_task:
   stiffness: 2.0
   weight: 1000.0
 
-# UR5e posture task (robot 0) -- resolves arm redundancy in the EE null space.
+# Arm posture task -- resolves arm redundancy in the EE null space. Restricted to the
+# 6 UR5e joints with selectActiveJoints (the merged robot also carries the base and
+# gripper joints, which have their own posture tasks).
 ur5e_posture:
   stiffness: 10.0
   weight: 5.0
@@ -42,27 +57,31 @@ ur5e_posture:
 base_command:
   mode: velocity
 
-# TriOrb posture task (robot 1) -- light regularization of the base joints.
+# Base posture task -- light regularization of the base joints. Restricted to
+# base_x / base_y / base_yaw with selectActiveJoints.
 triorb_posture:
   stiffness: 1.0
   weight: 1.0
 
-# Robotiq gripper posture task (robot 3) -- holds the knuckle joints of the model.
+# Robotiq gripper posture task -- holds the knuckle joints of the connected gripper.
+# Restricted to the gripper's own joints with selectActiveJoints. Only created when
+# `gripper.simulate` is on and the module could be connected.
 gripper_posture:
   stiffness: 1.0
   weight: 1.0
 
 # ---- Robotiq gripper -------------------------------------------------------
 # Two INDEPENDENT switches:
-#   simulate : load the gripper MODEL (a mc_robot_tools ConnectableRobotModule) as an
-#              extra robot and bolt it onto the UR5e "Tool" surface for visualization
-#              /collision. On this branch it is OFF -- we do not simulate the gripper.
+#   simulate : CONNECT the gripper MODEL (a mc_robot_tools ConnectableRobotModule) onto
+#              the arm's `tool0` link, for visualization/collision. It becomes part of
+#              the merged robot rather than a separate one. On this branch it is OFF --
+#              we do not simulate the gripper.
 #   command  : forward gripper_opening to the mc_robotiq GlobalPlugin datastore call
 #              `RobotiqGripper::setOpening` (0 = open, 1 = closed) to drive the REAL
 #              gripper. This does NOT need the model, so it stays ON.
 # Enable the RobotiqGripperPlugin in the global mc_rtc.yaml for the command path.
 gripper:
-  simulate: false                  # do not load the mc_robot_tools gripper model
+  simulate: false                  # do not connect the mc_robot_tools gripper model
   command: true                    # still drive the real gripper via the plugin
   model: Robotiq2f85Gripper        # or Robotiq2f140Gripper (used only when simulate: true)
   set_opening_call: "RobotiqGripper::setOpening"
@@ -80,23 +99,25 @@ ros:
 
 # ---- State observation (Encoder + Visual Odometry) -------------------------
 # The base STATE is grounded in realRobots() by the VisualOdometryObserver (VO), which
-# subscribes to a geometry_msgs/PoseStamped topic and writes the TriOrb planar joints,
-# then reconstructs the UR5e floating base from the mount (the arm<->base contact is a
-# QP construct and is NOT resolved for realRobots). The Encoder observer fills the arm
-# joints. This makes realRobots() fully consistent. See docs/observer.md.
+# subscribes to a geometry_msgs/PoseStamped topic and writes the base planar joints of the
+# merged robot. Since connect() puts the arm in the SAME kinematic tree as the base, the
+# observer's forwardKinematics() carries the arm too -- the old `attach` block that
+# reconstructed the arm's floating base is gone (it only existed because a QP contact is
+# not resolved for realRobots). The Encoder observer fills the arm joints. This makes
+# realRobots() fully consistent. See docs/observer.md and docs/connect_migration.md.
 ObserverPipelines:
   - name: CallmObservers
     gui: true
     log: true
     observers:
-      - type: VisualOdometry     # triorb base from VO + reconstruct ur5e floating base
+      - type: VisualOdometry     # merged robot's base planar joints from VO
         update: true
         gui: true
         # required: false -> load the controller even where the observer library is not
         # installed (e.g. the isolated smoke test); on hardware/superbuild it loads and
         # appears in the pipeline summary. A warning is logged if it is missing.
         required: false
-        robot: triorb
+        robot: callm            # the merged robot (see `connect.name` below)
         topic: "/robot_pose_slam"
         expected_frame_id: ""    # empty = skip header.frame_id check
         world_X_map:             # pose of the VO/map frame in the controller world
@@ -107,10 +128,7 @@ ObserverPipelines:
         timeout: 0.5             # s; older than this -> observer fails -> last pose held
         max_jump: 0.5            # m; larger step accepted (loop closure) but flagged; 0 = off
         planar_joints: [base_x, base_y, base_yaw]
-        attach:                  # Option 1: reconstruct the arm floating base
-          robot: ur5e
-          mount_body: mount
-      - type: Encoder            # ur5e arm joints from encoders
+      - type: Encoder            # arm joints from encoders
         update: true
 
 # How the control robots consume realRobots() each tick (QP FeedbackType):

@@ -1,8 +1,8 @@
 #include "CallmWbcController.h"
 
 #include <mc_rbdyn/Collision.h>
-#include <mc_rbdyn/PlanarSurface.h>
 #include <mc_rbdyn/RobotLoader.h>
+#include <mc_rbdyn/RobotModule.h>
 
 #include <mc_rtc/gui/ArrayInput.h>
 #include <mc_rtc/gui/ArrayLabel.h>
@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <memory>
+#include <utility>
 
 namespace
 {
@@ -62,20 +64,46 @@ std::array<double, 4> wireQuat(const sva::PTransformd & X)
 std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn::RobotModulePtr rm,
                                                                        const mc_rtc::Configuration & config)
 {
-  // robot 0: UR5e (the MainRobot, UR5eFloatingBase) ; 1: triorb ; 2: env/ground
-  std::vector<mc_rbdyn::RobotModulePtr> modules;
-  modules.push_back(rm);
-  modules.push_back(mc_rbdyn::RobotLoader::get_robot_module("triorb"));
-  modules.push_back(mc_rbdyn::RobotLoader::get_robot_module("env/ground"));
-
-  // robot 3: Robotiq gripper (optional). It is a ConnectableRobotModule from
-  // mc_robot_tools ("Robotiq2f85Gripper" / "Robotiq2f140Gripper"), loaded here as a
-  // separate robot and bolted onto the UR5e tool in reset(). If the module is not on
-  // the path we log and continue without it rather than aborting construction.
+  // The arm, the base and (optionally) the gripper are fused into ONE robot module with
+  // mc_rbdyn::RobotModule::connect, so the QP sees a single kinematic tree instead of
+  // separate robots held together by contacts. See docs/connect_migration.md.
   //
-  // `gripper.simulate` controls loading this MODEL only; commanding the real gripper
-  // goes through the mc_robotiq plugin (gripper.command) and is independent of it. Set
-  // simulate=false to run without the mc_robot_tools gripper model entirely.
+  // This runs from the member-initializer list (see the constructor), i.e. BEFORE
+  // MCController loads any robot -- which is exactly the situation connect() is meant
+  // for. mc_rtc does NOT support connecting robots that are already loaded in a
+  // controller (doc/_i18n/en/tutorials/advanced/new-robot.html, "Connecting existing
+  // robot modules"), so the attachment must be decided here and not in reset().
+  //
+  // robot 0: callm (triorb + UR5e [+ gripper]) ; robot 1: env/ground
+  std::string mergedName = "callm";
+  if(config.has("connect")) { config("connect")("name", mergedName); }
+
+  auto triorb = mc_rbdyn::RobotLoader::get_robot_module("triorb");
+  if(!triorb) { mc_rtc::log::error_and_throw("[CallmWbcController] Could not load the 'triorb' robot module"); }
+  if(!rm) { mc_rtc::log::error_and_throw("[CallmWbcController] No main robot module provided"); }
+
+  // 1. Arm onto the base. `triorb` is `this` so the merged root is its `odom` link and
+  // base_x/base_y/base_yaw keep their names (connect only prefixes `other`'s entities) --
+  // the VisualOdometry observer's planar_joints depend on that.
+  //
+  // `mount` (triorb.urdf) already carries the mounting height/orientation (z = 0.60,
+  // Rz(-90deg)), and the UR5e root link `base_link` is planted straight onto it, so both
+  // connection transforms are identity. This reproduces what the old Base<->Base contact
+  // did (posW(bodyPosW("mount")) + two coincident planar surfaces), but structurally.
+  //
+  // The default connection joint is Fixed (dof 0), so it is NOT appended to the merged
+  // ref_joint_order: rjo = [base_x, base_y, base_yaw] + [6 UR5e joints].
+  //
+  // An empty prefix is safe: triorb bodies/joints and UR5e bodies/joints are disjoint.
+  // `other`'s root joint is dropped by connect(), so passing the UR5eFloatingBase variant
+  // is fine -- its floating base is eliminated.
+  auto merged = triorb->connect(*rm, "mount", "base_link", "",
+                                mc_rbdyn::RobotModule::ConnectionParameters{}.name(mergedName));
+
+  // 2. Gripper onto the tool (optional). `gripper.simulate` controls loading this MODEL
+  // only; commanding the real gripper goes through the mc_robotiq plugin
+  // (gripper.command) and is independent of it. If the module is not on the path we log
+  // and continue without it rather than aborting construction.
   bool gripperSimulate = true;
   std::string gripperModule = "Robotiq2f85Gripper";
   if(config.has("gripper"))
@@ -90,15 +118,45 @@ std::vector<mc_rbdyn::RobotModulePtr> CallmWbcController::robotModules(mc_rbdyn:
     try
     {
       auto gm = mc_rbdyn::RobotLoader::get_robot_module(gripperModule);
-      if(gm) { modules.push_back(gm); }
-      else { mc_rtc::log::warning("[CallmWbcController] Gripper module '{}' not found; running without it", gripperModule); }
+      if(gm)
+      {
+        // Same shape as mc_kinova's attachTool (mc_kinova/src/module.cpp:112-114):
+        // parent.connect(tool, parent_frame, tool.baseFrame(), "", X_other_connection(
+        // tool.defaultMountingTransform())). We inline the two constants instead of
+        // linking mc_robot_tools for ConnectableRobotModule, because this package keeps
+        // robot modules as runtime plugins rather than link-time dependencies (see
+        // src/CMakeLists.txt). Both values are verified against
+        // mc_robot_tools/robotiq_gripper/src/robotiq_gripper.cpp: baseFrame() is
+        // "<prefix>_base_link" (:21-24) and defaultMountingTransform() is RotZ(pi) (:37-40).
+        // RotZ(pi) is its own inverse, so this reproduces the old posW(RotZ(pi) * toolPose).
+        //
+        // surfaceMapping is REQUIRED: the gripper's rsdf declares a planar surface also
+        // named "Base" (robotiq_2f_85_gripper.rsdf), which would silently clobber the
+        // UR5e's "Base" surface -- connect() validates convex/sensor/gripper/device name
+        // collisions but NOT surface ones.
+        const bool is140 = gripperModule.find("140") != std::string::npos;
+        const std::string gBaseLink = is140 ? "robotiq_140_base_link" : "robotiq_85_base_link";
+        merged = merged.connect(*gm, "tool0", gBaseLink, "",
+                                mc_rbdyn::RobotModule::ConnectionParameters{}
+                                    .name(mergedName)
+                                    .X_other_connection(sva::PTransformd(sva::RotZ(M_PI)))
+                                    .surfaceMapping({{"Base", "GripperBase"}}));
+      }
+      else
+      {
+        mc_rtc::log::warning("[CallmWbcController] Gripper module '{}' not found; running without it", gripperModule);
+      }
     }
     catch(const std::exception & e)
     {
-      mc_rtc::log::warning("[CallmWbcController] Could not load gripper module '{}': {}. Running without it",
+      mc_rtc::log::warning("[CallmWbcController] Could not connect gripper module '{}': {}. Running without it",
                            gripperModule, e.what());
     }
   }
+
+  std::vector<mc_rbdyn::RobotModulePtr> modules;
+  modules.push_back(std::make_shared<mc_rbdyn::RobotModule>(std::move(merged)));
+  modules.push_back(mc_rbdyn::RobotLoader::get_robot_module("env/ground"));
   return modules;
 }
 
@@ -135,23 +193,32 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
     g("command", gripperCommandEnabled_); // forward opening to the mc_robotiq plugin (real gripper)
   }
   const bool is140 = gripperModule_.find("140") != std::string::npos;
-  gripperRobot_ = is140 ? "robotiq_2f_140_gripper" : "robotiq_2f_85_gripper";
   gripperBaseLink_ = is140 ? "robotiq_140_base_link" : "robotiq_85_base_link";
-  gripperEnabled_ = robots().hasRobot(gripperRobot_); // model loaded (independent of command)
+  // The gripper is no longer a separate robot: robotModules() connects it into the merged
+  // module, so "is the model loaded" is now "does the merged robot carry the gripper base
+  // link". The command path (mc_robotiq plugin) stays independent of this.
+  gripperEnabled_ = robot().hasBody(gripperBaseLink_);
 
-  // Ensure the gripper has the attachment surface used by the Tool<->Base contact in
-  // reset(). mc_robot_tools ships it in an RSDF, but that RSDF is not always installed
-  // where mc_rtc looks; add an equivalent planar surface at runtime if it is missing
-  // (same approach as the TriOrb ArmMount surface). Footprint matches the RSDF (+-0.0375).
-  if(gripperEnabled_ && !robot(gripperRobot_).hasSurface(gripperBaseSurface_))
+  // The gripper joints are whatever the merged robot has that is neither an arm nor a base
+  // joint -- derived from the model rather than hardcoded, so mimic/knuckle naming stays an
+  // implementation detail of the gripper module. Used for the posture task joint selector.
+  if(gripperEnabled_)
   {
-    std::vector<std::pair<double, double>> gPts = {
-        {-0.0375, -0.0375}, {0.0375, -0.0375}, {0.0375, 0.0375}, {-0.0375, 0.0375}};
-    robot(gripperRobot_)
-        .addSurface(std::make_shared<mc_rbdyn::PlanarSurface>(gripperBaseSurface_, gripperBaseLink_,
-                                                              sva::PTransformd::Identity(), "plastic", gPts));
-    mc_rtc::log::info("[CallmWbcController] added runtime '{}' surface on {}::{}", gripperBaseSurface_, gripperRobot_,
-                      gripperBaseLink_);
+    for(const auto & j : robot().mb().joints())
+    {
+      if(j.dof() == 0) { continue; }
+      const auto & n = j.name();
+      const bool isArm = std::find(armJointNames_.begin(), armJointNames_.end(), n) != armJointNames_.end();
+      const bool isBase = std::find(baseJointNames_.begin(), baseJointNames_.end(), n) != baseJointNames_.end();
+      if(!isArm && !isBase) { gripperJointNames_.push_back(n); }
+    }
+    if(gripperJointNames_.empty())
+    {
+      mc_rtc::log::warning("[CallmWbcController] gripper base link '{}' is present but it has no actuated joints; "
+                           "no gripper posture task will be created",
+                           gripperBaseLink_);
+      gripperEnabled_ = false;
+    }
   }
 
   // ---- ROS interface options -----------------------------------------------
@@ -173,22 +240,23 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   config("feedback", feedback);
   feedbackType_ = parseFeedback(feedback);
 
-  // ---- Constraints + main-robot posture ------------------------------------
+  // ---- Constraints + arm posture -------------------------------------------
+  // robot 0 is now the merged robot, so mc_rtc's built-in robot-0 constraints cover the
+  // base, the arm and the gripper in one go: no per-robot KinematicsConstraint is needed
+  // any more, and selfCollisionConstraint is seeded from the merged module's
+  // minimalSelfCollisions (connect() carries over the UR5e's -- see docs/connect_migration.md).
   solver().addConstraintSet(contactConstraint);
-  solver().addConstraintSet(kinematicsConstraint); // UR5e (robot 0) joint limits
-  solver().addConstraintSet(selfCollisionConstraint); // UR5e self-collisions
-  solver().addTask(postureTask); // UR5e posture (robot 0)
-  solver().setContacts({}); // start with no contacts; couplings are added in reset()
-
-  // ---- Arm <-> base attachment surface -------------------------------------
-  // The TriOrb module ships no RSDF surfaces, so we declare, at runtime, a planar
-  // surface on its `mount` link that mirrors the UR5e "Base" surface. The arm's
-  // floating base is contacted onto this surface in reset(). The points match the
-  // UR5e base footprint (see mc_ur5e_description/rsdf/ur5e/base_link.rsdf).
-  std::vector<std::pair<double, double>> mountPoints = {
-      {-0.0745, -0.0745}, {0.0745, -0.0745}, {0.0745, 0.0745}, {-0.0745, 0.0745}};
-  robot("triorb").addSurface(std::make_shared<mc_rbdyn::PlanarSurface>(
-      armMountSurface_, "mount", sva::PTransformd::Identity(), "plastic", mountPoints));
+  solver().addConstraintSet(kinematicsConstraint); // merged robot joint limits (base + arm + gripper)
+  solver().addConstraintSet(selfCollisionConstraint); // merged robot self-collisions
+  // postureTask spans the whole merged robot, so restrict it to the arm joints: it is the
+  // `posture_arm` entry of the WbcData 4-task contract. The base and the gripper get their
+  // own posture tasks over disjoint joint sets in reset().
+  postureTask->selectActiveJoints(solver(), armJointNames_);
+  solver().addTask(postureTask);
+  // The arm<->base and tool<->gripper attachments are structural now (connect()), so the
+  // QP has no contacts at all: the base is carried by its base_x/base_y/base_yaw joints
+  // and the ground robot is visual only.
+  solver().setContacts({});
 
   // ---- Arm <-> base collision avoidance ------------------------------------
   // mc_rtc auto-builds an sch::S_Box collision convex named "base" for the TriOrb
@@ -196,6 +264,10 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   // file is needed. We guard the distal arm links against that box. base_link and
   // shoulder_link are intentionally excluded: the arm base is rigidly mounted on
   // top of the base, so they sit permanently against it by design.
+  //
+  // Both sides now live in the merged robot, so this is a SELF-collision pair.
+  // MCController::addCollisions handles r1 == r2 (it builds a CollisionsConstraint over
+  // the same robot index twice).
   bool enableArmBaseCollision = true;
   double ciDist = 0.05; // interaction distance: avoidance starts engaging here
   double csDist = 0.02; // safety distance: hard lower bound on separation
@@ -212,14 +284,14 @@ CallmWbcController::CallmWbcController(mc_rbdyn::RobotModulePtr rm,
   {
     std::vector<mc_rbdyn::Collision> armBaseCollisions;
     for(const auto & link : armLinks) { armBaseCollisions.push_back({link, "base", ciDist, csDist, 0.0}); }
-    addCollisions("ur5e", "triorb", armBaseCollisions);
+    addCollisions(robot().name(), robot().name(), armBaseCollisions);
   }
 
   setupTargetsIO();
   setupRos();
 
-  mc_rtc::log::success("CallmWbcController init done (gripper model: {}, command: {})",
-                       gripperEnabled_ ? gripperRobot_ : "not simulated", gripperCommandEnabled_ ? "on" : "off");
+  mc_rtc::log::success("CallmWbcController init done (merged robot: {}, gripper model: {}, command: {})", robot().name(),
+                       gripperEnabled_ ? gripperBaseLink_ : "not simulated", gripperCommandEnabled_ ? "on" : "off");
 }
 
 CallmWbcController::~CallmWbcController()
@@ -296,10 +368,8 @@ void CallmWbcController::setupTargetsIO()
       mc_rtc::gui::Button("Sync targets to current robot",
                           [this]()
                           {
-                            datastore().assign<sva::PTransformd>(EE_TARGET_KEY,
-                                                                 robots().robot("ur5e").surfacePose("Tool"));
-                            datastore().assign<sva::PTransformd>(BASE_TARGET_KEY,
-                                                                 robots().robot("triorb").bodyPosW("base"));
+                            datastore().assign<sva::PTransformd>(EE_TARGET_KEY, robot().surfacePose("Tool"));
+                            datastore().assign<sva::PTransformd>(BASE_TARGET_KEY, robot().bodyPosW("base"));
                           }));
 }
 
@@ -464,8 +534,7 @@ void CallmWbcController::integrateBaseVelocity()
   // pure sim keeps progressing. See docs/observer.md.
   // Trade-off: the base is velocity-controlled (motion via the refVelB feed-forward);
   // it does NOT catch up on lag. See docs/base_velocity_target.md.
-  const sva::PTransformd Xcur = useMeasuredBase() ? realRobot("triorb").bodyPosW("base")
-                                                  : robots().robot("triorb").bodyPosW("base");
+  const sva::PTransformd Xcur = useMeasuredBase() ? realRobot().bodyPosW("base") : robot().bodyPosW("base");
   const auto & R = Xcur.rotation();
   double yaw = std::atan2(R(0, 1), R(0, 0)); // SVA RotZ convention (planar base)
   const double c = std::cos(yaw), s = std::sin(yaw);
@@ -504,15 +573,14 @@ void CallmWbcController::exportBaseVelocity()
   // Only active when the TriorbBasePlugin is loaded (it registers this key).
   if(!datastore().has(triorbCmdKey_)) { return; }
 
-  auto & tri = robots().robot("triorb");
+  auto & tri = robot();
   const double xd = tri.mbc().alpha[tri.jointIndexByName("base_x")][0]; // world-frame ẋ (commanded)
   const double yd = tri.mbc().alpha[tri.jointIndexByName("base_y")][0]; // world-frame ẏ (commanded)
   const double wz = tri.mbc().alpha[tri.jointIndexByName("base_yaw")][0]; // θ̇ (commanded)
   // Rotate the commanded world velocity into the *measured* base body frame the plugin
   // expects: use realRobot's yaw (VO) under closed-loop feedback, else the control yaw.
-  const double yaw = useMeasuredBase()
-                         ? realRobot("triorb").mbc().q[realRobot("triorb").jointIndexByName("base_yaw")][0]
-                         : tri.mbc().q[tri.jointIndexByName("base_yaw")][0];
+  const double yaw = useMeasuredBase() ? realRobot().mbc().q[realRobot().jointIndexByName("base_yaw")][0]
+                                       : tri.mbc().q[tri.jointIndexByName("base_yaw")][0];
   const double c = std::cos(yaw), s = std::sin(yaw);
   // world -> body; the plugin is configured with command_in_world_frame: false.
   const Eigen::Vector3d body(c * xd + s * yd, -s * xd + c * yd, wz);
@@ -523,62 +591,61 @@ void CallmWbcController::reset(const mc_control::ControllerResetData & reset_dat
 {
   mc_control::MCController::reset(reset_data);
 
-  // 1. Initial poses, set BEFORE the coupling contacts are added. The TriOrb root
-  // (`world`) stays at the origin; the base is carried by its base_x/base_y/base_yaw
-  // joints. The arm's floating base is planted directly ON the TriOrb `mount` frame,
-  // so the UR5e "Base" surface coincides with the runtime-added "ArmMount" surface and
-  // the URDF (base_to_mount in triorb.urdf: currently Rz(-90deg), z=0.60) is the single
-  // source of truth for the mounting orientation/height. This also composes correctly
-  // with any nonzero base reset pose (unlike a hard-coded world transform).
-  robots().robot("triorb").posW(sva::PTransformd::Identity());
-  robots().robot(0).posW(robots().robot("triorb").bodyPosW("mount"));
+  // 1. Initial pose. There is a single robot now, so this is one call: the merged root
+  // (triorb's `odom` link) goes to the origin and the base is carried by its
+  // base_x/base_y/base_yaw joints. The arm and the gripper follow through the merged
+  // kinematic tree -- the mounting geometry lives in the connect joints (built from
+  // triorb.urdf's `mount`: z=0.60, Rz(-90deg)), so there is nothing left to keep in sync.
+  //
+  // The old "posW() BEFORE addContact()" rule no longer applies: it existed because a
+  // contact captures its frame at add time (mc_rtc's mobile-arm-controller tutorial), and
+  // there are no contacts any more. posW() must still precede the task reset()s below,
+  // since those seed their targets from the current pose.
+  robots().robot(0).posW(sva::PTransformd::Identity());
 
-  // 2. Rigid arm<->base attachment (all 6 dof constrained). Added AFTER posW so the
-  // contact frame captures the intended relative pose.
-  addContact({"triorb", "ur5e", armMountSurface_, "Base"});
-
-  // 3. WBC tasks.
+  // 2. WBC tasks. They all address the merged robot (index 0) now.
   eeTask_ = std::make_shared<mc_tasks::SurfaceTransformTask>("Tool", robots(), 0, eeStiffness_, eeWeight_);
   eeTask_->reset(); // target := current Tool pose
   solver().addTask(eeTask_);
 
-  baseTask_ = std::make_shared<mc_tasks::TransformTask>("base", robots(), 1, baseStiffness_, baseWeight_);
+  baseTask_ = std::make_shared<mc_tasks::TransformTask>("base", robots(), 0, baseStiffness_, baseWeight_);
   baseTask_->reset(); // target := current base pose
   solver().addTask(baseTask_); // gains are (re)applied every tick from the datastore, see applyCommandsToTasks
   baseTargetPose_ = baseTask_->target();
 
-  // Per-robot constraint + light posture for the base (regularizes base_x/base_y/base_yaw).
-  triorbKinematics_ = std::make_unique<mc_solver::KinematicsConstraint>(robots(), 1, solver().dt());
-  solver().addConstraintSet(triorbKinematics_);
+  // Light posture regularizing the base joints only -- the `base_posture` entry of the
+  // WbcData 4-task contract. Base joint limits already come from the merged robot's
+  // kinematicsConstraint, so no extra KinematicsConstraint is needed here.
+  //
+  // Several posture tasks may share a robot (they are ordinary weighted objectives over
+  // disjoint joint sets), but they must be renamed: PostureTask derives its name from the
+  // robot name, so all of them would be "posture_<robot>" and collide in the log/GUI. The
+  // name has to be set before addTask().
   triorbPostureTask_ =
-      std::make_shared<mc_tasks::PostureTask>(solver(), 1, triorbPostureStiffness_, triorbPostureWeight_);
+      std::make_shared<mc_tasks::PostureTask>(solver(), 0, triorbPostureStiffness_, triorbPostureWeight_);
+  triorbPostureTask_->name("posture_base");
+  triorbPostureTask_->selectActiveJoints(solver(), baseJointNames_);
   solver().addTask(triorbPostureTask_);
 
-  // 4. Robotiq gripper: bolt it onto the UR5e tool and regularize its knuckle joints.
-  if(gripperEnabled_ && robots().hasRobot(gripperRobot_))
+  // 3. Robotiq gripper: connect() already bolted it onto the tool, so all that is left is
+  // to regularize its knuckle joints (a fixed regularizer, not exposed to WbcData).
+  if(gripperEnabled_)
   {
-    const unsigned int gi = robots().robot(gripperRobot_).robotIndex();
-    // Place the gripper base at the tool with the module's default mounting transform
-    // (RobotiqGripperRobotModule::defaultMountingTransform() == RotZ(pi)), then freeze
-    // the attachment with a rigid Tool<->Base contact.
-    const sva::PTransformd toolPose = robots().robot("ur5e").surfacePose("Tool");
-    const sva::PTransformd mount(sva::RotZ(M_PI));
-    robots().robot(gripperRobot_).posW(mount * toolPose);
-    addContact({"ur5e", gripperRobot_, "Tool", gripperBaseSurface_});
-
-    gripperKinematics_ = std::make_unique<mc_solver::KinematicsConstraint>(robots(), gi, solver().dt());
-    solver().addConstraintSet(gripperKinematics_);
     gripperPostureTask_ =
-        std::make_shared<mc_tasks::PostureTask>(solver(), gi, gripperPostureStiffness_, gripperPostureWeight_);
+        std::make_shared<mc_tasks::PostureTask>(solver(), 0, gripperPostureStiffness_, gripperPostureWeight_);
+    gripperPostureTask_->name("posture_gripper");
+    gripperPostureTask_->selectActiveJoints(solver(), gripperJointNames_);
     solver().addTask(gripperPostureTask_);
   }
 
-  // 5. UR5e standby posture (resolves arm redundancy in the null space of the EE task).
+  // 4. Arm standby posture (resolves arm redundancy in the null space of the EE task).
+  // postureTask was restricted to the arm joints in the constructor; the selector survives
+  // reset (MCController::reset only re-seeds the posture target, not the dimWeight).
   postureTask->stiffness(ur5ePostureStiffness_);
   postureTask->weight(ur5ePostureWeight_);
   const std::vector<double> armStandby = {0.0, -M_PI / 2, M_PI / 2, 0.0, 0.0, 0.0};
 
-  // 6. Seed the commanded targets so the robot holds still until a commander moves them.
+  // 5. Seed the commanded targets so the robot holds still until a commander moves them.
   datastore().assign<sva::PTransformd>(EE_TARGET_KEY, eeTask_->target());
   datastore().assign<sva::PTransformd>(BASE_TARGET_KEY, baseTask_->target());
   datastore().assign<Eigen::Vector3d>(BASE_VELOCITY_KEY, Eigen::Vector3d::Zero());
@@ -678,7 +745,8 @@ void CallmWbcController::handleCommand(const std_msgs::msg::Float64MultiArray::S
 WbcData CallmWbcController::collectMeasured() const
 {
   WbcData m;
-  const auto & ur5e = robots().robot("ur5e");
+  // Arm and base now live in the same (merged) robot.
+  const auto & ur5e = robot();
   const sva::PTransformd toolPose = ur5e.surfacePose("Tool");
   m.eef_pos = {toolPose.translation().x(), toolPose.translation().y(), toolPose.translation().z()};
   m.eef_quat = wireQuat(toolPose); // standard ROS/Hamilton (see wireQuat)
@@ -687,7 +755,7 @@ WbcData CallmWbcController::collectMeasured() const
     m.posture_arm[i] = ur5e.mbc().q[ur5e.jointIndexByName(armJointNames_[i])][0];
   }
 
-  const auto & tri = robots().robot("triorb");
+  const auto & tri = robot();
   for(size_t i = 0; i < baseJointNames_.size(); ++i)
   {
     m.posture_base[i] = tri.mbc().q[tri.jointIndexByName(baseJointNames_[i])][0];

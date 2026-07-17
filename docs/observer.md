@@ -29,54 +29,51 @@ The TriOrb is modelled **fixed-base with explicit planar joints**
 (`base_x` prismatic, `base_y` prismatic, `base_yaw` continuous;
 `mc_triorb_description/urdf/triorb.urdf`). Its `mb().joint(0)` is `Fixed`, so
 `posW()` cannot encode the planar pose — the pose lives in those three joints.
-**The observer therefore writes the three planar joints of `realRobot("triorb")`
+**The observer therefore writes the three planar joints of `realRobot()`
 (+ `forwardKinematics`/`forwardVelocity`), not `posW()`.**
 
-## The subtlety that shaped this design: contacts are QP-only
+## Historical note: why this used to be harder
 
-The arm is bolted to the base by a rigid contact `triorb::ArmMount ↔ ur5e::Base`.
-It is natural to expect that contact to place the UR5e floating base once the base
-moves. It does — **but only for the control copy.** The contact is a QP
-constraint, enforced during the solve on `robots()`
-(`mc_rtc/src/mc_solver/TasksQPSolver.cpp` — constraints updated at `:312`, solved
-at `:320`). **`realRobots()` never pass through the QP**; no solver, no contact
-resolution runs on them. `runClosedLoop` does not *solve* the real copy, it
-*copies* `realRobot.mbc().q` into the control copy (`TasksQPSolver.cpp:304`).
+This design once had to work around a real subtlety, and it is worth recording why it
+no longer does.
 
-Consequence: nothing positions `realRobot("ur5e")`'s floating base. The
-`EncoderObserver` only writes actuated joints and runs FK from the *existing*
-floating base (`mc_rtc/src/mc_observers/EncoderObserver.cpp:128-143`) — the
-tutorial states this plainly ("still missing the floating base"). So when VO moves
-`realRobot("triorb")`, the arm's real copy would detach from the base's real copy.
+When the arm was a **separate robot** bolted on by a rigid contact
+(`triorb::ArmMount ↔ ur5e::Base`), that contact placed the UR5e floating base — **but
+only for the control copy.** A contact is a QP constraint, enforced during the solve on
+`robots()` (`mc_rtc/src/mc_solver/TasksQPSolver.cpp` — constraints updated at `:312`,
+solved at `:320`). **`realRobots()` never pass through the QP**; no solver, no contact
+resolution runs on them. `runClosedLoop` does not *solve* the real copy, it *copies*
+`realRobot.mbc().q` into the control copy (`TasksQPSolver.cpp:304`).
 
-This is a consequence of the rig being **two robots joined by a contact** rather
-than one kinematic tree. In the real copy the contact must be reproduced
-explicitly.
+So nothing positioned `realRobot("ur5e")`'s floating base — the `EncoderObserver` only
+writes actuated joints and runs FK from the *existing* floating base
+(`mc_rtc/src/mc_observers/EncoderObserver.cpp:128-143`). When VO moved
+`realRobot("triorb")`, the arm's real copy detached from the base's. The observer had to
+reproduce the contact explicitly, via an `attach:` block that did
+`realRobot("ur5e").posW(realRobot("triorb").bodyPosW("mount"))`.
 
-## Full realRobots consistency (the fix)
+**That whole problem was an artifact of the rig being two robots joined by a contact
+rather than one kinematic tree.**
 
-Because the UR5e base is *rigidly* bolted to the TriOrb `mount`, its floating-base
-pose is a deterministic function of the base pose — a reconstruction, not a
-measurement. The observer reconstructs it (mirrors `reset()`'s
-`posW(bodyPosW("mount"))`, `CallmWbcController.cpp:542`):
+## Full realRobots consistency (now free)
 
-```cpp
-realRobot("ur5e").posW( realRobot("triorb").bodyPosW("mount") );
-realRobot("ur5e").forwardKinematics();
-```
+Since the migration to `mc_rbdyn::RobotModule::connect` (see
+[connect_migration.md](connect_migration.md)) there is exactly **one** robot: the arm
+hangs off the base through a fixed connect joint in the *same* `MultiBody`. Writing the
+base planar joints and calling `forwardKinematics()` therefore carries the arm — and the
+gripper — automatically. There is no floating base left to reconstruct, and the `attach:`
+option is obsolete (it warns if still configured).
 
-Result — `realRobots()` is fully consistent:
+`realRobots()` is fully consistent with no special handling:
 
 | realRobots component | source |
 |---|---|
-| `triorb` base joints `base_x/base_y/base_yaw` | **VisualOdometry observer** (VO) |
-| `ur5e` arm joints | **Encoder observer** |
-| `ur5e` floating base | **VO observer, reconstructed from `triorb` `mount`** |
+| base joints `base_x/base_y/base_yaw` of `callm` | **VisualOdometry observer** (VO) |
+| arm joints of `callm` | **Encoder observer** |
+| arm/gripper link poses | **merged-tree FK** — implied by the two above |
 
-With the real copy coherent for *both* robots, the QP feedback mode (`FeedbackType`)
-becomes a free, safe choice (see below). This reconstruction is **Option 1**:
-folded into the VisualOdometry observer (config `attach:` block) so the arm base is
-re-derived from the base pose the same observer just set.
+With the real copy coherent, the QP feedback mode (`FeedbackType`) is a free, safe
+choice (see below).
 
 ## Observer pipeline
 
@@ -86,10 +83,10 @@ ObserverPipelines:
     gui: true
     log: true
     observers:
-      - type: VisualOdometry     # updates triorb base (VO) + reconstructs ur5e floating base
+      - type: VisualOdometry     # updates the merged robot's base planar joints from VO
         update: true
         gui: true
-        robot: triorb
+        robot: callm                     # the merged robot (connect.name)
         topic: /robot_pose_slam
         expected_frame_id: ""            # empty = skip header.frame_id check
         world_X_map: {translation: [0,0,0], rotation: [0,0,0]}   # world <- map (VO) transform
@@ -97,29 +94,27 @@ ObserverPipelines:
         planar: true                     # take x,y,yaw from VO; z,roll,pitch = fixed
         timeout: 0.5                     # s; older than this -> run() fails -> last pose held
         max_jump: 0.5                    # m; larger step accepted (loop closure) but warned + flagged
-        attach:                          # Option 1: reconstruct the arm floating base
-          robot: ur5e
-          mount_body: mount              # body on `robot: triorb` the arm base is bolted to
-      - type: Encoder            # updates ur5e arm joints from encoders
+        planar_joints: [base_x, base_y, base_yaw]
+      - type: Encoder            # updates the arm joints from encoders
         update: true
 ```
 
-Ordering `VisualOdometry -> Encoder` lets the arm-joint FK use the freshly set
-floating base. (The observer also re-runs `ur5e` FK after setting the FF, so the
-order is robust either way.) The pipeline summary line at startup prints the
-observers (bracketed entries do not update the real robot).
+Ordering `VisualOdometry -> Encoder` lets the arm-joint FK run on top of the freshly
+set base pose. Both observers now write the *same* robot and each re-runs FK, so the
+order is robust either way. The pipeline summary line at startup prints the observers
+(bracketed entries do not update the real robot).
 
 ## Per-tick data flow
 
 1. **Pipeline `run()`+`update()`** (before `MCController::run()`):
-   - VO observer: `realRobot("triorb")` base joints ← latest cached VO pose (+FK/FV);
-     then `realRobot("ur5e").posW(realRobot("triorb").bodyPosW("mount"))` (+FK).
-   - Encoder observer: `realRobot("ur5e")` arm joints (+FK).
+   - VO observer: `realRobot("callm")` base joints ← latest cached VO pose (+FK/FV).
+     The FK carries the arm and gripper too — they are in the same tree.
+   - Encoder observer: `realRobot("callm")` arm joints (+FK).
    - If VO is stale, VO `run()` returns `false`; the pipeline **skips `update()`**
      (`ObserverPipeline.cpp:170`) so the last good real pose is held.
 2. **Controller `run()`**:
    - ROS command → datastore → live tasks/gains.
-   - Base-target re-base anchor read from `realRobot("triorb")` only under closed-loop
+   - Base-target re-base anchor read from `realRobot()` only under closed-loop
      feedback with fresh VO (`useMeasuredBase()`), else the control base (so open-loop
      VO does not move the control base; pure sim keeps moving).
    - `MCController::run(fType)` — the QP; under a closed-loop `fType` it resets the
@@ -144,7 +139,7 @@ config key `feedback`:
 
 Because realRobots is now consistent, `observed` no longer feeds the arm a stale
 floating base. Caveat: `observed`/`observed_real` reset the base from
-`realRobot("triorb")`, which in **pure sim with no VO publisher** holds the reset
+`realRobot()`, which in **pure sim with no VO publisher** holds the reset
 pose → the base would freeze. Use `none` in that case. This is a mode choice, not
 a bug.
 
@@ -165,13 +160,13 @@ base pose" — must be *the state the QP builds at this tick*, which is decided 
 
 | Situation (`useMeasuredBase()`) | Anchor source | Why |
 |---|---|---|
-| closed-loop (`observed`/`observed_real`) **and** VO fresh | `realRobot("triorb").bodyPosW("base")` | the QP resets the control base to `realRobot` before solving, so the target must be relative to `realRobot` (`TasksQPSolver.cpp:304`) |
-| open-loop (`none`/`joints`), or VO stale | `robots().robot("triorb").bodyPosW("base")` | the control base is **not** grounded to `realRobots`, so it re-bases off itself; VO updates `realRobots()` only and does **not** move the control base |
+| closed-loop (`observed`/`observed_real`) **and** VO fresh | `realRobot().bodyPosW("base")` | the QP resets the control base to `realRobot` before solving, so the target must be relative to `realRobot` (`TasksQPSolver.cpp:304`) |
+| open-loop (`none`/`joints`), or VO stale | `robot().bodyPosW("base")` | the control base is **not** grounded to `realRobots`, so it re-bases off itself; VO updates `realRobots()` only and does **not** move the control base |
 
 ```cpp
 useMeasuredBase() = isClosedLoop(feedback) && voAlive();
-anchor = useMeasuredBase() ? realRobot("triorb").bodyPosW("base")
-                           : robots().robot("triorb").bodyPosW("base");
+anchor = useMeasuredBase() ? realRobot().bodyPosW("base")
+                           : robot().bodyPosW("base");
 ```
 
 Gating on the feedback mode (not just VO) is deliberate: under `feedback: none` with VO
@@ -182,7 +177,7 @@ tick)* and stall the base. The guard prevents both.
 
 **Timing — why `FeedbackType` does not cover this.** Within one tick:
 
-1. observer pipeline updates `realRobot("triorb")` ← fresh VO
+1. observer pipeline updates `realRobot()` ← fresh VO
 2. controller `run()` **pre-QP**: `integrateBaseVelocity()` reads the anchor **here**
 3. `MCController::run(fType)` → the QP, where a closed-loop `fType` resets the
    control base from `realRobot` (`TasksQPSolver.cpp:304`)
@@ -254,7 +249,7 @@ Savitzky–Golay, as `SLAMObserver` does for pose) is the v2 alternative.
 - Removed: the controller's own SLAM subscription / `handleSlamPose` / `SlamPose` /
   `base_state.from_slam` machinery — the observer now owns the VO subscription.
 - `MCController::run()` call takes a configurable `FeedbackType` (`feedback` key).
-- Base-target re-base anchor and export yaw read `realRobot("triorb")` only under
+- Base-target re-base anchor and export yaw read `realRobot()` only under
   closed-loop feedback with fresh VO (`useMeasuredBase()`); open-loop leaves the control
   base independent of VO.
 - `exportBaseVelocity()` still exports the control (commanded) base velocity.

@@ -12,7 +12,11 @@
 # Task gains/topics live in the controller's own CallmWbcController.yaml.
 # ===========================================================================
 
-MainRobot: UR5eFloatingBase
+# MainRobot is the ARM module only. CallmWbcController does not use it as robot 0: it
+# connects it onto the TriOrb base and hands MCController the merged "callm" module (see
+# docs/connect_migration.md). The fixed variant is correct now -- the arm has no floating
+# base once bolted on.
+MainRobot: UR5e
 Enabled: CallmWbcController
 
 # Controller period. mc_rtde requires Timestep to be an integer multiple of
@@ -31,12 +35,33 @@ Timestep: 0.005
 feedback: observed
 
 # ---- mc_rtde (Universal Robots) interface ---------------------------------
+#
+# !! BROKEN ON THIS BRANCH -- mc_rtde needs a patch before this run config works. !!
+#
+# mc_rtde assumes one mc_rtc robot == one UR arm, i.e. that robot.refJointOrder() IS the
+# arm's 6 joints. After the connect() migration robot 0 is the merged "callm" robot whose
+# ref_joint_order is 9 entries: [base_x, base_y, base_yaw] + [6 UR5e joints]. Consequences:
+#
+#  - The key below must name the robot in the controller. That robot is now `callm`, not
+#    `ur5e`, so mc_rtde's `rtdeConfig.has(robot.name())` check (src/URControl.cpp:93) does
+#    not match and NO UR control loop is created -- the arm is silently never driven.
+#  - Renaming the key to `callm` to force a match is WORSE: URControlType<Position>::control
+#    (src/URControlType.h:41-52) writes q[i] for i < rjo.size() into a vector of 6 -> heap
+#    buffer overflow. Velocity mode instead sends base commands to the arm's shoulder.
+#
+# The fix (out of scope for the connect migration, see docs/connect_migration.md §7) is a
+# joint-subset mapping in mc_rtde: a per-robot `joints:` list naming the 6 UR joints in
+# driver order, resolved once to mbc/rjo indices, plus a read-modify-write encoder slice.
+# Something must also supply encoder values for base_x/base_y/base_yaw.
+#
+# Simulation (mc_rtc ticker) is unaffected and works today.
 RTDE:
   ControlMode: Position       # CallmWbcController commands the arm by joint position
   RobotTimestep: 0.001        # UR low-level loop (>= 1 ms)
-  ur5e:                       # must match the arm's robot name in the controller
+  callm:                      # must match the merged robot name (connect.name)
     ip: "192.168.1.100"       # <-- set to your UR controller IP
     driver: "ur_rtde"         # ur_rtde (>=CB3) or ur_modern_driver (<=CB2)
+    # joints: [...]           # <-- required by the future mc_rtde patch; ignored today
 
 # ---- Global plugins (run in the same loop, I/O off the RT thread) ---------
 Plugins: [TriorbBasePlugin, RobotiqGripperPlugin]

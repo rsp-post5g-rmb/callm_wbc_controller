@@ -1,7 +1,10 @@
 # This configuration is used to run a few iterations of the controller as a smoke
 # test. It requires the UR5e, TriOrb and Robotiq gripper robot modules to be on the
 # module path (they are, when built inside mc_rtc_superbuild).
-MainRobot: UR5eFloatingBase
+#
+# MainRobot is the ARM module only: the controller connects it onto the TriOrb base and
+# runs the merged "callm" module as robot 0 (see docs/connect_migration.md).
+MainRobot: UR5e
 Enabled: CallmWbcController
 
 ClearControllerModulePath: true

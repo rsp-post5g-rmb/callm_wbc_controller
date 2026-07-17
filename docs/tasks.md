@@ -71,20 +71,30 @@ $$
 e_5 = q_{\mathrm{grip}} - q^\star_{\mathrm{grip}},\qquad J_5 = S_{\mathrm{grip}}
 $$
 
-## Coupling contact (equality)
+## Coupling: none (structural)
 
-Rigid 6-DoF contact `triorb::ArmMount` $\leftrightarrow$ `ur5e::Base` — the UR5e floating
-base $X_{\mathrm{fb}}$ tracks the TriOrb mount:
+There is **no coupling constraint**. The arm is attached to the base — and the gripper to
+the arm — by fixed *connect joints* inside a single merged robot module, so the coupling
+is a property of the kinematic tree rather than an equality the QP has to enforce:
 
 $$
-J_c\,\ddot q + \dot J_c\,\dot q = 0
+q = \big[\underbrace{q_x,\,q_y,\,q_\theta}_{\text{base}},\;
+        \underbrace{q_1 \ldots q_6}_{\text{arm}},\;
+        \underbrace{q_{\mathrm{grip}}}_{\text{gripper}}\big]
 $$
 
-(and, when simulated, `ur5e::Tool` $\leftrightarrow$ `gripper::Base`.)
+is one configuration vector of one robot, and every link pose is a function of it. The
+QP runs with an empty contact set.
+
+Previously this was a rigid 6-DoF contact `triorb::ArmMount` $\leftrightarrow$ `ur5e::Base`
+imposing $J_c\,\ddot q + \dot J_c\,\dot q = 0$ on the UR5e floating base (and
+`ur5e::Tool` $\leftrightarrow$ `gripper::Base` when simulated). Both are gone, along with
+the floating base itself. See [connect_migration.md](connect_migration.md).
 
 ## Constraint set $\mathcal C$
 
-Kinematic limits (UR5e, TriOrb) as bounds on $\ddot q$:
+Kinematic limits (base + arm + gripper — one `kinematicsConstraint` on the merged robot)
+as bounds on $\ddot q$:
 
 $$
 \underline q \le q \le \overline q,\qquad \lvert\dot q\rvert \le \dot q^{\max}

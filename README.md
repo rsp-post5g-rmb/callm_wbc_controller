@@ -20,26 +20,30 @@ Model
 
 | Index | Robot | Role |
 | --- | --- | --- |
-| 0 | `UR5eFloatingBase` | main robot, arm with a floating base |
-| 1 | `triorb` | the mobile base |
-| 2 | `env/ground` | visual reference only |
-| (3) | `robotiq_2f_85_gripper` | gripper model — **only when `gripper.simulate: true`** (off on this branch) |
+| 0 | `callm` | **merged**: `triorb` base + `UR5e` arm (+ Robotiq gripper when `gripper.simulate: true`) |
+| 1 | `env/ground` | visual reference only |
 
-- The UR5e floating base is rigidly attached to the TriOrb `mount` link through a
-  Base&harr;Base contact. When the QP moves the base the arm follows; when the
-  end-effector task pulls the hand, the solver distributes motion across both the
-  arm joints and the base dof &mdash; whole-body coordination with no explicit IK.
+- The arm and the gripper are attached with `mc_rbdyn::RobotModule::connect`, **not**
+  with contacts: `robotModules()` fuses the modules before `MCController` loads them,
+  so the QP sees **one kinematic tree** from `odom` through `base_x`/`base_y`/`base_yaw`
+  to the fingertips. When the end-effector task pulls the hand, the solver distributes
+  motion across both the arm joints and the base dof &mdash; whole-body coordination
+  with no explicit IK.
+  See [docs/connect_migration.md](docs/connect_migration.md) for why, and for the API
+  evidence that this must happen at module-assembly time rather than in `reset()`.
+- The attachment is **structural**: no coupling constraint, no contact frame to capture,
+  and the QP runs with **no contacts at all** (`solver().setContacts({})`).
+- `MainRobot` is the **arm module only** (`UR5e`). The controller does not use it as
+  robot 0 — it connects it onto the base and hands `MCController` the merged module.
 - **No base&harr;ground dof-masked contact is used.** The TriOrb module is
   *fixed-base* with explicit planar joints (`base_x`, `base_y`, `base_yaw`), so
   planar motion is intrinsic to the kinematics and solved directly by the QP.
-- The TriOrb description ships no RSDF surfaces, so the attachment surface
-  `ArmMount` is declared on the `mount` link at runtime, in the constructor.
 - The **Robotiq gripper** has two independent switches:
-  - `gripper.simulate` — load the gripper **model** (a `mc_robot_tools`
-    `ConnectableRobotModule`, `Robotiq2f85Gripper` / `Robotiq2f140Gripper`) as an
-    extra robot and bolt it onto the UR5e `Tool` surface via a rigid
-    `Tool`&harr;`Base` contact (`defaultMountingTransform` = `RotZ(pi)`). **Off on
-    this branch**, so there is no `mc_robot_tools` dependency.
+  - `gripper.simulate` — **connect** the gripper **model** (a `mc_robot_tools`
+    `ConnectableRobotModule`, `Robotiq2f85Gripper` / `Robotiq2f140Gripper`) onto the
+    arm's `tool0` link, so it becomes part of the merged robot
+    (`defaultMountingTransform` = `RotZ(pi)`). **Off on this branch**, so there is no
+    `mc_robot_tools` dependency.
   - `gripper.command` — forward `gripper_opening` to the `mc_robotiq` plugin
     (`RobotiqGripper::setOpening`) to drive the **real** gripper. **On.** This path
     is independent of the model: it only needs the plugin's datastore call to exist.
@@ -47,14 +51,21 @@ Model
 Tasks / constraints
 --
 
-- `contactConstraint`, `kinematicsConstraint` (UR5e), `selfCollisionConstraint`
-  (UR5e), plus a per-robot `KinematicsConstraint` for the TriOrb (and one for the
-  gripper only when `gripper.simulate: true`).
-- **Arm&harr;base collision avoidance** via `addCollisions("ur5e", "triorb", ...)`.
+- `contactConstraint`, `kinematicsConstraint`, `selfCollisionConstraint` — all of
+  mc_rtc's built-ins bind to robot 0, which is now the whole merged robot, so they
+  cover the base, the arm and the gripper in one go. There are **no per-part
+  `KinematicsConstraint`s** any more. `connect()` carries the UR5e's
+  `minimalSelfCollisions` into the merged module automatically.
+- **Arm&harr;base collision avoidance** via `addCollisions("callm", "callm", ...)` — a
+  *self*-collision pair now that both sides are in one robot.
   mc_rtc auto-builds an `sch::S_Box` collision convex (named `base`) from the
   TriOrb URDF `<box>`, so no hull file is needed. Guarded links and distances are
   set in `arm_base_collision`; `base_link`/`shoulder_link` are excluded (the arm
   base is mounted on the base).
+- The three posture tasks all live on robot 0 and are restricted to **disjoint** joint
+  sets with `selectActiveJoints` (arm / base / gripper), which preserves the 4-task
+  `WbcData` contract. They are renamed before `addTask` because `PostureTask` derives
+  its name from the robot name.
 - `SurfaceTransformTask` on the UR5e `Tool` surface (arm end-effector).
 - `TransformTask` on the TriOrb `base` body (base command).
 - `PostureTask` for the UR5e (arm redundancy), a light `PostureTask` for the base,
