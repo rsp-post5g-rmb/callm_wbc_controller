@@ -6,7 +6,7 @@
 # One MCGlobalController loop:
 #   - mc_rtde     drives the UR5e arm (position mode, over RTDE)
 #   - TriorbBasePlugin   drives the TriOrb base (serial, off the RT loop)
-#   - RobotiqGripperPlugin drives the gripper (socket, off the RT loop)
+#   - RobotiqGripperPlugin drives the real gripper (socket, off the RT loop)
 #
 # Adapt the UR IP, the serial port, and the gripper host to your rig.
 # Task gains/topics live in the controller's own CallmWbcController.yaml.
@@ -20,8 +20,8 @@ MainRobot: UR5e
 Enabled: CallmWbcController
 
 # Controller period. mc_rtde requires Timestep to be an integer multiple of
-# RTDE.RobotTimestep. The multi-robot QP (arm+base+gripper+contacts+collisions)
-# is heavy, so run the controller at 200 Hz over a 1 kHz robot loop.
+# RTDE.RobotTimestep. The QP (one merged base+arm+gripper robot, no contacts, plus
+# self-collisions) runs at 200 Hz over a 1 kHz robot loop.
 Timestep: 0.005
 
 # State observation is defined by the controller itself (CallmWbcController.yaml,

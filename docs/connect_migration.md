@@ -160,7 +160,7 @@ Because `MCController` binds its built-ins to **robot 0**:
 - `postureTask` (`:215`) now spans base + arm + gripper joints.
 
 The last one would collapse the `WbcData` 4-task contract
-(`[ee, posture_arm, base, base_posture]`). Fix: **joint selection**, per
+(`[callm_ee, ur5e_posture, triorb_base, triorb_posture]`). Fix: **joint selection**, per
 `mc_rtc/doc/_i18n/en/tutorials/recipes/joint-select.md` and
 `PostureTask.h:46`. Three posture tasks on robot 0 with **disjoint** active sets are
 mathematically identical to today's three per-robot tasks, because
@@ -175,14 +175,43 @@ logger/GUI. They are therefore renamed via `MetaTask::name()` (`MetaTask.h:64`),
 must happen **before** `addTask` (`MetaTask.h:61`).
 
 Also:
-- arm↔base collision moves from `addCollisions("ur5e", "triorb", ...)` to
-  `addCollisions("callm", "callm", ...)`. `MCController::addCollisions` handles
-  `r1 == r2` — the swap guard at `MCController.cpp:946` is skipped and it builds a
-  self-collision `CollisionsConstraint` (`:961-965`).
+- arm↔base collision is now a **self**-collision pair, added straight to the existing
+  `selfCollisionConstraint` — which is what mc_rtc itself does for the module's own
+  self-collisions (`MCController.cpp:214`).
+
+  `addCollisions("callm", "callm", ...)` also *works* (the `r1 != r2` swap guard at
+  `MCController.cpp:946` is skipped and it builds a self-collision `CollisionsConstraint`
+  at `:961-965`), but it builds a **second** `CollisionsConstraint` over pair (0,0). Both
+  derive their GUI category from the robot names (`CollisionsConstraint.cpp:482`), so the
+  second one's `"Automatic monitor"` checkbox fails to register:
+
+  > `[error] An element named Automatic monitor already exists in Collisions/callm/callm`
+
+  Harmless to the QP — `addElement` logs and discards (`StateBuilder.hpp:56-58`), and both
+  constraint sets are enforced — but it costs a GUI control and is pure redundancy. Before
+  the merge this could not happen: `Collisions/ur5e/triorb` ≠ `Collisions/ur5e/ur5e`.
 - the runtime `ArmMount` planar surface on `mount` existed **only** to support the
   Base–Base contact → **removed**.
 - the runtime gripper `Base` surface fallback existed **only** to support the
   Tool–Base contact → **removed**.
+
+### Task naming
+
+With `ur5e` and `triorb` collapsed into one robot, "which robot does this task belong to"
+stopped being answerable from the task itself. Tasks are therefore named after the part
+they act on:
+
+| Prefix | Scope | Tasks |
+| --- | --- | --- |
+| `callm_` | the whole merged robot | `callm_ee` |
+| `ur5e_` | the 6 arm joints only | `ur5e_posture` |
+| `triorb_` | the 3 base joints only | `triorb_base`, `triorb_posture` |
+| `gripper_` | the gripper's own joints only | `gripper_posture` |
+
+`callm_ee` is `callm_` rather than `ur5e_` on purpose: the `Tool` surface is on the arm,
+but the QP is free to reach its target with the base as much as with the arm — that is
+the whole point of merging them. The `gripper_` prefix matches the one the gripper's
+connect gives its joints.
 
 ### New `reset()` ordering
 

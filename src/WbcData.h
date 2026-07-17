@@ -18,9 +18,9 @@
  *     - velocity_base      -> base body velocity (integrated into the base task)
  *     - gripper_opening    -> Robotiq plugin command (RobotiqGripper::setOpening)
  *     - posture_base       -> TriOrb PostureTask target (joint-space base command)
- *     - task_weights       -> per-task QP priority ("mode": high w_ee = Cartesian arm,
- *                             high w_posture_arm = joint-space arm; likewise w_base vs
- *                             w_base_posture for the base)
+ *     - task_weights       -> per-task QP priority ("mode": high callm_ee = Cartesian
+ *                             arm, high ur5e_posture = joint-space arm; likewise
+ *                             triorb_base vs triorb_posture for the base)
  *     - task_stiffness     -> per-task tracking gain (compliance axis)
  *     - task_damping_ratio -> per-task damping: when stiffness > 0 this is the damping
  *                             ratio zeta (D = 2*zeta*sqrt(stiff), zeta = 1 => critical);

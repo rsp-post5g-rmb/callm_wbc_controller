@@ -1,8 +1,9 @@
 # CallmWbcController — Quickstart
 
 Whole-body controller for a **UR5e arm on a TriOrb omnidirectional base** with a
-**Robotiq 2F gripper**, coordinated in a single QP. This guide gets you from a fresh
-checkout to driving the robot — in RViZ simulation first, then on hardware.
+**Robotiq 2F gripper** — all fused into a single robot with `connect()` and coordinated
+in a single QP. This guide gets you from a fresh checkout to driving the robot — in RViZ
+simulation first, then on hardware.
 
 For the design/architecture, see [`../README.md`](../README.md). This doc is the
 "how do I run it" companion.
@@ -13,11 +14,11 @@ For the design/architecture, see [`../README.md`](../README.md). This doc is the
 
 | Piece | What it is |
 | --- | --- |
-| `CallmWbcController` | the controller (this repo) — one QP over arm + base + gripper |
-| robots | `ur5e` (0), `triorb` (1), `env/ground` (2), `robotiq_2f_85_gripper` (3) |
+| `CallmWbcController` | the controller (this repo) — one QP over the merged robot |
+| robots | `callm` (0) — TriOrb base + UR5e arm + gripper, merged by `connect()`; `env/ground` (1) |
 | command in | ROS2 `WbcData` message, the GUI, or the datastore |
 | base state | SLAM pose (`/robot_pose_slam`) folded into the base joints |
-| hardware | `mc_rtde` drives the arm; `TriorbBasePlugin` the base; `RobotiqGripperPlugin` the gripper — **one loop** |
+| hardware | `mc_rtde` drives the arm; `TriorbBasePlugin` the base; `RobotiqGripperPlugin` the gripper — **one loop**. ⚠️ `mc_rtde` needs a patch first, see [`connect_migration.md`](connect_migration.md) §7 |
 
 ---
 
@@ -30,10 +31,10 @@ build-ordering dependencies):
 | Dependency | Provides |
 | --- | --- |
 | [`mc_rtc`](https://jrl-umi3218.github.io/mc_rtc/) (with the ROS plugin) | framework + `mc_rtc::mc_rtc_ros` |
-| `mc_ur5e` / `mc_ur5e_description` | `UR5eFloatingBase` robot module, `Tool` surface |
+| `mc_ur5e` / `mc_ur5e_description` | `UR5e` robot module (the arm; merged onto the base), `Tool` surface |
 | `mc_triorb_module` / `mc_triorb_description` | `triorb` robot module |
 | `mc_robot_tools` | `Robotiq2f85Gripper` robot module (gripper mesh/collision) |
-| `mc_robotiq` | `RobotiqGripperPlugin` (gripper command over socket) |
+| `mc_robotiq` | `RobotiqGripperPlugin` (gripper command over socket) — hardware only |
 | `mc_triorb` | `TriorbBasePlugin` (base driver, serial) — hardware only |
 | `mc_rtde` | UR hardware interface (`MCControlRtde`) — hardware only |
 
@@ -87,8 +88,10 @@ roslaunch mc_rtc_ticker display.launch   # RViZ with the mc_rtc panels
 ```
 
 In sim, **everything hardware-related is inert**: no gripper plugin, no base plugin,
-no SLAM. The base is driven by the in-QP velocity integration, and the arm/base/gripper
-targets come from the GUI (category **`CallmWbc`**) or the ROS2 client.
+no SLAM. The base is driven by the in-QP velocity integration, and the arm/base targets
+come from the GUI (category **`CallmWbc`**) or the ROS2 client. The gripper model is
+connected into the robot and visualised, but `gripper_opening` only reaches real hardware
+through the plugin.
 
 The smoke-test config in [`tests/etc/mc_rtc.yaml`](../tests/etc/mc_rtc.yaml) shows a
 minimal setup (it additionally enables the gripper plugin).
@@ -96,6 +99,11 @@ minimal setup (it additionally enables the gripper plugin).
 ---
 
 ## 5. Run on hardware (arm + base + gripper, one loop)
+
+> ⚠️ **Not working on this branch yet.** `mc_rtde` assumes one mc_rtc robot == one UR arm
+> (`refJointOrder()` *is* the arm's 6 joints). The merged `callm` robot has 9. It needs a
+> joint-subset patch first — see [`connect_migration.md`](connect_migration.md) §7. The
+> config below is kept ready for that.
 
 Use the **`mc_rtde`** interface — it owns the real-time loop and drives the UR arm; the
 base and gripper ride along as global plugins. A ready example config is
@@ -107,13 +115,14 @@ MCControlRtde -f /usr/local/etc/mc_controller/etc/mc_rtde_callm.yaml
 
 Edit that file for your rig:
 
-- `RTDE.ur5e.ip` — the UR controller IP.
+- `RTDE.callm.ip` — the UR controller IP.
 - `TriorbBasePlugin.port` — the base serial device (e.g. `/dev/ttyACM0`).
 - `RobotiqGripperPlugin.host` — the UR running the Robotiq URCap socket.
 
 Key points already set for you in that config:
 
-- `MainRobot: UR5eFloatingBase`, `ControlMode: Position`, `Timestep: 0.005` over
+- `MainRobot: UR5e` (the arm module only — the controller connects it onto the base and
+  runs the merged `callm` robot), `ControlMode: Position`, `Timestep: 0.005` over
   `RobotTimestep: 0.001` (controller must be an integer multiple of the robot loop).
 - An `Encoder` observer feeds the UR joint encoders back into the arm.
 - `Plugins: [TriorbBasePlugin, RobotiqGripperPlugin]`, with the base plugin set
@@ -122,10 +131,10 @@ Key points already set for you in that config:
 **Data flow on hardware, per tick:**
 
 ```
-SLAM /robot_pose_slam ─▶ base_x/base_y/base_yaw (control robot)   [before QP]
-ROS WbcData ──────────▶ EE / arm posture / base vel / gripper targets
+VO /robot_pose_slam ──▶ base_x/base_y/base_yaw of realRobot("callm")  [observer]
+ROS WbcData ──────────▶ callm_ee / ur5e_posture / triorb_base vel / gripper
                          │
-                         ▼  single QP (arm + base + gripper coordinated)
+                         ▼  single QP (one merged robot: base + arm + gripper)
    arm joint q ─▶ mc_rtde ─▶ UR5e
    base vel   ─▶ Triorb::cmd_velocity ─▶ TriorbBasePlugin ─▶ base
    gripper    ─▶ RobotiqGripper::setOpening ─▶ RobotiqGripperPlugin ─▶ gripper
@@ -144,8 +153,8 @@ Three interchangeable ways; the **datastore is the single source of truth**, and
 - `Base velocity [vx, vy, wyaw] (body)` — drive the base by body velocity.
 - `Arm posture [rad]` — the 6 UR5e joints.
 - `Gripper opening (0=open, 1=closed)` — slider.
-- `Task weights [w_ee, w_arm, w_base]` — QP task weights (the "mode": high `w_ee` =
-  Cartesian, high `w_arm` = joint-space).
+- `Task weights` — QP task weights (the "mode": high `callm_ee` = Cartesian, high
+  `ur5e_posture` = joint-space).
 - `Base pose (inactive path)` — absolute base pose (only used with `base_command.mode: pose`).
 
 ### b) ROS2 client (`WbcData`)
@@ -160,17 +169,17 @@ The controller subscribes to **`callm_wbc/command`** and republishes state on
 | `eef_quat` | 4 | ✅ | EE target orientation `(w,x,y,z)` |
 | `posture_arm` | 6 | ✅ | UR5e joints (ref_joint_order) |
 | `posture_base` | 3 | ✅ | TriOrb base joints (joint-space base command) |
-| `gripper_opening` | 1 | ✅ | **0 = open, 1 = closed** |
+| `gripper_opening` | 1 | ✅ | **0 = open, 1 = closed** — real gripper only, not modelled |
 | `velocity_base` | 3 | ✅ | `(vx, vy, wyaw)` base body frame |
 | `task_weights` | 4 | ✅ | per-task QP weight = **mode**; `<0` keeps default |
 | `task_stiffness` | 4 | ✅ | per-task tracking gain = **compliance** |
 | `task_damping_ratio` | 4 | ✅ | ζ when stiffness>0 (`D=2ζ√K`); absolute D when stiffness=0 (velocity damper) |
 
-Gain vectors are ordered `[ee, posture_arm, base, base_posture]`.
+Gain vectors are ordered `[callm_ee, ur5e_posture, triorb_base, triorb_posture]`.
 
-**Modes = gains (client-side).** Weight the tasks to pick behaviour: high `w_ee` =
-Cartesian arm; high `w_posture_arm` with `w_ee=0` = joint-space arm; likewise `w_base`
-(velocity) vs `w_base_posture` (joint) for the base. Lower `task_stiffness` for a soft
+**Modes = gains (client-side).** Weight the tasks to pick behaviour: high `callm_ee` =
+Cartesian arm; high `ur5e_posture` with `callm_ee=0` = joint-space arm; likewise
+`triorb_base` (velocity) vs `triorb_posture` (joint) for the base. Lower `task_stiffness` for a soft
 task. Presets `se3` / `direct` / `joint` / `compliant` live in the Python client
 (`WbcData.set_mode("se3")`).
 
@@ -224,11 +233,10 @@ ObserverPipelines:
     observers:
       - type: VisualOdometry
         update: true
-        robot: triorb
+        robot: callm             # the merged robot (connect.name)
         topic: "/robot_pose_slam"
         world_X_map: { translation: [0,0,0], rotation: [0,0,0] }  # map -> controller world
         timeout: 0.5
-        attach: { robot: ur5e, mount_body: mount }   # reconstruct the arm floating base
       - type: Encoder            # arm joints
         update: true
 
@@ -255,23 +263,29 @@ Sanity check (raw/identity map): right after a reset, `/robot_pose_slam` should 
 
 | File | Purpose |
 | --- | --- |
-| [`etc/CallmWbcController.in.yaml`](../etc/CallmWbcController.in.yaml) | controller config: task gains, gripper, ROS topics, `base_state` |
+| [`etc/CallmWbcController.in.yaml`](../etc/CallmWbcController.in.yaml) | controller config: `connect.name`, task gains, gripper command, ROS topics, `base_state` |
 | [`etc/mc_rtde_callm.yaml`](../etc/mc_rtde_callm.yaml) | example **hardware** run config (mc_rtde + both plugins) |
 | [`tests/etc/mc_rtc.yaml`](../tests/etc/mc_rtc.yaml) | smoke-test / minimal run config |
 
 Notable controller-config knobs:
 
 ```yaml
-ee_task:      { stiffness: 5.0,  weight: 1000.0 }   # arm end-effector
-base_task:    { stiffness: 2.0,  weight: 1000.0 }   # base transform (+ optional `damping`)
-ur5e_posture: { stiffness: 10.0, weight: 5.0 }      # arm redundancy
-base_command: { mode: velocity }                    # "velocity" (active) or "pose"
-gripper:      { enable: true, model: Robotiq2f85Gripper }
+connect:          { name: callm }                        # merged robot = robot 0
+callm_ee_task:    { stiffness: 5.0,  weight: 1000.0 }   # Tool target, whole robot
+triorb_base_task: { stiffness: 2.0,  weight: 1000.0 }   # base transform
+ur5e_posture:     { stiffness: 10.0, weight: 5.0 }      # arm redundancy (arm joints only)
+triorb_posture:   { stiffness: 1.0,  weight: 1.0 }      # base regularizer (base joints only)
+gripper_posture:  { stiffness: 1.0,  weight: 1.0 }      # gripper knuckles (gripper joints only)
+base_command:     { mode: velocity }                    # "velocity" (active) or "pose"
+gripper:          { simulate: true, model: Robotiq2f85Gripper, command: true }
 ```
+
+> **Naming:** `callm_*` acts on the whole merged robot; `ur5e_*`, `triorb_*` and
+> `gripper_*` act on the arm, base and gripper joints only (via `selectActiveJoints`).
 
 > **Damping note:** there is no generic "damping task" in mc_rtc
 > (`mc_tasks::force::DampingTask` is a force/admittance task needing a force sensor).
-> Base damping = the `base_task.damping` gain (default `2*sqrt(stiffness)`).
+> Shape damping at runtime via the `task_damping_ratio` field.
 
 ---
 

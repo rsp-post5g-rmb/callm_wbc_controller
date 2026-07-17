@@ -2,10 +2,11 @@ CallmWbcController
 ==
 
 Whole-body controller ([mc_rtc]) that coordinates a **UR5e arm** mounted on a
-**TriOrb omnidirectional base**, with a **Robotiq 2F gripper** on the tool, in a
-single QP. It is adapted from the mc_rtc *Mobile arm controller* tutorial,
-replacing Dingo with the TriOrb module and restructuring it as a reusable WBC
-controller (no scripted phase machine) driven by a ROS2 command client.
+**TriOrb omnidirectional base**, with a **Robotiq 2F gripper** on the tool — all three
+fused into a single robot with `connect()` — in a single QP. It is adapted from
+the mc_rtc *Mobile arm controller* tutorial, replacing Dingo with the TriOrb module and
+restructuring it as a reusable WBC controller (no scripted phase machine) driven by a
+ROS2 command client.
 
 > **New here?** Start with [`docs/quickstart.md`](docs/quickstart.md) — build, run in
 > RViZ, run on hardware, and command the robot. This README covers the design.
@@ -13,22 +14,20 @@ controller (no scripted phase machine) driven by a ROS2 command client.
 Model
 --
 
-> **Branch `no_gripper_sim`:** the gripper **model** is not loaded/simulated
-> (`gripper.simulate: false`) — so this build has no dependency on the
-> `mc_robot_tools` gripper module — but the **real** gripper is still driven via the
-> `mc_robotiq` plugin (`gripper.command: true`). See the gripper notes below.
+> **Branch `connectRobot`:** the arm and the gripper are attached with `connect()` instead
+> of contacts, fusing everything into one `callm` robot. See the notes below.
 
 | Index | Robot | Role |
 | --- | --- | --- |
 | 0 | `callm` | **merged**: `triorb` base + `UR5e` arm (+ Robotiq gripper when `gripper.simulate: true`) |
 | 1 | `env/ground` | visual reference only |
 
-- The arm and the gripper are attached with `mc_rbdyn::RobotModule::connect`, **not**
-  with contacts: `robotModules()` fuses the modules before `MCController` loads them,
-  so the QP sees **one kinematic tree** from `odom` through `base_x`/`base_y`/`base_yaw`
-  to the fingertips. When the end-effector task pulls the hand, the solver distributes
-  motion across both the arm joints and the base dof &mdash; whole-body coordination
-  with no explicit IK.
+- The arm and the gripper are attached with `mc_rbdyn::RobotModule::connect`, **not** with
+  contacts: `robotModules()` fuses the modules before `MCController` loads them, so the QP
+  sees **one kinematic tree** from `odom` through `base_x`/`base_y`/`base_yaw` to the
+  fingertips. When the end-effector task pulls the hand, the solver distributes motion
+  across both the arm joints and the base dof &mdash; whole-body coordination with no
+  explicit IK.
   See [docs/connect_migration.md](docs/connect_migration.md) for why, and for the API
   evidence that this must happen at module-assembly time rather than in `reset()`.
 - The attachment is **structural**: no coupling constraint, no contact frame to capture,
@@ -40,40 +39,53 @@ Model
   planar motion is intrinsic to the kinematics and solved directly by the QP.
 - The **Robotiq gripper** has two independent switches:
   - `gripper.simulate` — **connect** the gripper **model** (a `mc_robot_tools`
-    `ConnectableRobotModule`, `Robotiq2f85Gripper` / `Robotiq2f140Gripper`) onto the
-    arm's `tool0` link, so it becomes part of the merged robot
-    (`defaultMountingTransform` = `RotZ(pi)`). **Off on this branch**, so there is no
-    `mc_robot_tools` dependency.
+    `ConnectableRobotModule`, `Robotiq2f85Gripper` / `Robotiq2f140Gripper`) onto the arm's
+    `tool0` link, so it becomes part of the merged robot
+    (`defaultMountingTransform` = `RotZ(pi)`). Its bodies/joints/surfaces get a `gripper_`
+    prefix. If this is on and the module cannot be loaded, construction **fails loudly**.
   - `gripper.command` — forward `gripper_opening` to the `mc_robotiq` plugin
-    (`RobotiqGripper::setOpening`) to drive the **real** gripper. **On.** This path
-    is independent of the model: it only needs the plugin's datastore call to exist.
+    (`RobotiqGripper::setOpening`) to drive the **real** gripper. This path is independent
+    of the model: the plugin moves no model joints, so it works with `simulate: false`.
 
 Tasks / constraints
 --
 
+**Naming.** Every task is named after the part it acts on:
+
+| Prefix | Scope | Tasks |
+| --- | --- | --- |
+| `callm_` | the whole merged robot | `callm_ee` |
+| `ur5e_` | the 6 arm joints only | `ur5e_posture` |
+| `triorb_` | the 3 base joints only | `triorb_base`, `triorb_posture` |
+| `gripper_` | the gripper's own joints only | `gripper_posture` |
+
+- `callm_ee` — `SurfaceTransformTask` on the `Tool` surface. `callm_` because the QP is
+  free to reach the target with the base as much as with the arm; that is the point of
+  merging them.
+- `triorb_base` — `TransformTask` on the `base` body (base command).
+- `ur5e_posture` — mc_rtc's built-in `postureTask`, renamed and restricted to the arm
+  joints (arm redundancy in the `callm_ee` null space).
+- `triorb_posture` — light `PostureTask` restricted to the base joints.
+- `gripper_posture` — light `PostureTask` holding the gripper's knuckle joints (only when
+  `gripper.simulate: true`). Its joints carry the `gripper_` prefix from the connect.
+- The posture tasks all live on robot 0 over **disjoint** joint sets via
+  `selectActiveJoints`, which preserves the 4-task `WbcData` contract. They are renamed
+  before `addTask` because `PostureTask` derives its name from the robot name, so they
+  would all otherwise be `posture_callm`.
 - `contactConstraint`, `kinematicsConstraint`, `selfCollisionConstraint` — all of
-  mc_rtc's built-ins bind to robot 0, which is now the whole merged robot, so they
-  cover the base, the arm and the gripper in one go. There are **no per-part
+  mc_rtc's built-ins bind to robot 0, which is the whole merged robot, so they cover the
+  base, the arm and the gripper in one go. There are **no per-part
   `KinematicsConstraint`s** any more. `connect()` carries the UR5e's
   `minimalSelfCollisions` into the merged module automatically.
-- **Arm&harr;base collision avoidance** via `addCollisions("callm", "callm", ...)` — a
-  *self*-collision pair now that both sides are in one robot.
-  mc_rtc auto-builds an `sch::S_Box` collision convex (named `base`) from the
-  TriOrb URDF `<box>`, so no hull file is needed. Guarded links and distances are
-  set in `arm_base_collision`; `base_link`/`shoulder_link` are excluded (the arm
-  base is mounted on the base).
-- The three posture tasks all live on robot 0 and are restricted to **disjoint** joint
-  sets with `selectActiveJoints` (arm / base / gripper), which preserves the 4-task
-  `WbcData` contract. They are renamed before `addTask` because `PostureTask` derives
-  its name from the robot name.
-- `SurfaceTransformTask` on the UR5e `Tool` surface (arm end-effector).
-- `TransformTask` on the TriOrb `base` body (base command).
-- `PostureTask` for the UR5e (arm redundancy), a light `PostureTask` for the base,
-  and (when the gripper is simulated) a light `PostureTask` holding its knuckle joints.
+- **Arm&harr;base collision avoidance** — now a *self*-collision pair, added straight to
+  `selfCollisionConstraint` (both sides are in one robot). mc_rtc auto-builds an
+  `sch::S_Box` collision convex (named `base`) from the TriOrb URDF `<box>`, so no hull
+  file is needed. Guarded links and distances are set in `arm_base_collision`;
+  `base_link`/`shoulder_link` are excluded (the arm base is mounted on the base).
 - **Damping:** there is *no* generic "damping task" in mc_rtc &mdash;
   `mc_tasks::force::DampingTask` is an admittance/force-control task that requires
   a force sensor. Damping/regularization here is the `damping` coefficient of the
-  trajectory tasks (`base_task.damping`, optional; default `2*sqrt(stiffness)`)
+  trajectory tasks (`triorb_base_task.damping`, optional; default `2*sqrt(stiffness)`)
   together with the light posture tasks.
 
 Command contract (WbcData)
@@ -84,27 +96,28 @@ carries all fields every message:
 
 | Field | Size | Active? | Destination |
 | --- | --- | --- | --- |
-| `eef_pos` | 3 | yes | arm EE `SurfaceTransformTask` target (position) |
-| `eef_quat` | 4 (w,x,y,z) | yes | arm EE `SurfaceTransformTask` target orientation — **standard ROS/Hamilton** (tf2/RViz), world frame |
-| `posture_arm` | 6 | yes | arm `PostureTask` target |
-| `posture_base` | 3 | yes | TriOrb `PostureTask` target (joint-space base command) |
+| `eef_pos` | 3 | yes | `callm_ee` target (position) |
+| `eef_quat` | 4 (w,x,y,z) | yes | `callm_ee` target orientation — **standard ROS/Hamilton** (tf2/RViz), world frame |
+| `posture_arm` | 6 | yes | `ur5e_posture` target |
+| `posture_base` | 3 | yes | `triorb_posture` target (joint-space base command) |
 | `gripper_opening` | 1 | yes | `RobotiqGripper::setOpening` (0 = open, 1 = closed) |
 | `velocity_base` | 3 (vx,vy,wyaw) | yes | base body velocity |
 | `task_weights` | 4 | yes | per-task QP weight — **selects the "mode"** |
 | `task_stiffness` | 4 | yes | per-task tracking gain — **compliance** |
 | `task_damping_ratio` | 4 | yes | ζ when stiffness > 0 (`D = 2ζ√K`, ζ=1 critical); **absolute D** when stiffness = 0 ([gains.md](docs/gains.md)) |
 
-The three gain vectors are ordered **`[ee, posture_arm, base, base_posture]`**.
+The three gain vectors are ordered **`[callm_ee, ur5e_posture, triorb_base, triorb_posture]`**.
 
 **Modes are gains, chosen by the client.** The controller is a generic weighted-QP
 executor: it never switches modes itself, it just applies whatever gains arrive (a
 value `< 0` keeps the current/YAML-default value; `>= 0` is adopted, weights/stiffness
 clamped `>= 0`). So the client picks behaviour by weighting tasks:
 
-- **arm**: high `w_ee` = Cartesian (posture regularizes); high `w_posture_arm` with
-  `w_ee = 0` = joint-space (`posture_arm` drives the joints).
-- **base**: high `w_base` = velocity-driven (from `velocity_base`); high `w_base_posture`
-  with `w_base = 0` = joint-space (`posture_base` drives `base_x/base_y/base_yaw`).
+- **arm**: high `callm_ee` = Cartesian (posture regularizes); high `ur5e_posture` with
+  `callm_ee = 0` = joint-space (`posture_arm` drives the joints).
+- **base**: high `triorb_base` = velocity-driven (from `velocity_base`); high
+  `triorb_posture` with `triorb_base = 0` = joint-space (`posture_base` drives
+  `base_x/base_y/base_yaw`).
 - **compliance**: lower `task_stiffness` for a soft/springy task; `task_damping_ratio`
   shapes overshoot (ζ = 1 critical; only lower it deliberately). Set a task's stiffness
   to 0 to turn it into a pure **velocity damper** (then `task_damping_ratio` is the
@@ -114,13 +127,13 @@ clamped `>= 0`). So the client picks behaviour by weighting tasks:
 Presets (`se3`, `direct`, `joint`, `compliant`) live in the Python client
 (`scripts/callm_wbc_client.py`, `MODE_PRESETS` / `WbcData.set_mode()`); the active
 gains are echoed back on the measured topic. A degenerate weight set that leaves the
-arm (`w_ee + w_posture_arm`) or the base (`w_base + w_base_posture`) with no authority
-is rejected and the previous weights kept.
+arm (`callm_ee + ur5e_posture`) or the base (`triorb_base + triorb_posture`) with no
+authority is rejected and the previous weights kept.
 
 Base command: **velocity is the active path.** `velocity_base` (body frame) is
 integrated into the `TransformTask` target each control step, with a body-velocity
 feed-forward (`refVelB`). The absolute base-pose path (`BASE_TARGET_KEY` / the
-GUI *Base target [world]* marker) is kept as an inactive/overridable alternative,
+GUI *triorb_base target [world]* marker) is kept as an inactive/overridable alternative,
 selected with `base_command.mode: pose`. Exactly one path drives the base, so the
 two never fight in the QP.
 

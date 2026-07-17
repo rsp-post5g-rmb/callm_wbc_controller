@@ -62,7 +62,7 @@ Since the migration to `mc_rbdyn::RobotModule::connect` (see
 hangs off the base through a fixed connect joint in the *same* `MultiBody`. Writing the
 base planar joints and calling `forwardKinematics()` therefore carries the arm — and the
 gripper — automatically. There is no floating base left to reconstruct, and the `attach:`
-option is obsolete (it warns if still configured).
+option has been removed.
 
 `realRobots()` is fully consistent with no special handling:
 

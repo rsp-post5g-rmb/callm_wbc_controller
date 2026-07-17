@@ -26,68 +26,75 @@ connect:
   name: callm
 
 # ---- Whole-body task gains -------------------------------------------------
-# Arm end-effector task ("Tool" surface of the merged robot).
-ee_task:
+# Task keys are named after the part each task acts on:
+#   callm_*  -- the whole merged robot
+#   ur5e_*   -- the 6 arm joints only  (selectActiveJoints)
+#   triorb_* -- the 3 base joints only (selectActiveJoints)
+#   gripper_ -- the gripper's own joints only (selectActiveJoints)
+
+# End-effector task ("Tool" surface). callm_ because the QP is free to reach the target
+# with the base as much as with the arm -- that is the point of merging them.
+callm_ee_task:
   stiffness: 5.0
   weight: 1000.0
 
-# Base command task ("base" body of the merged robot). Drives base_x / base_y /
-# base_yaw to reach the commanded planar pose.
-base_task:
+# Base command task ("base" body). Drives base_x / base_y / base_yaw to reach the
+# commanded planar pose.
+triorb_base_task:
   stiffness: 2.0
   weight: 1000.0
 
-# Arm posture task -- resolves arm redundancy in the EE null space. Restricted to the
-# 6 UR5e joints with selectActiveJoints (the merged robot also carries the base and
-# gripper joints, which have their own posture tasks).
+# Arm posture task -- resolves arm redundancy in the callm_ee null space. This is
+# mc_rtc's built-in postureTask, renamed and restricted to the 6 arm joints.
 ur5e_posture:
   stiffness: 10.0
   weight: 5.0
+
+# Base posture task -- light regularization of the base joints.
+triorb_posture:
+  stiffness: 1.0
+  weight: 1.0
+
+# Gripper posture task -- holds the knuckle joints of the connected gripper model. Only
+# created when `gripper.simulate` is on. Its joints carry the "gripper_" prefix that the
+# gripper connect() applies, hence the name.
+gripper_posture:
+  stiffness: 1.0
+  weight: 1.0
 
 # NOTE on damping: task damping is seeded critical (2*sqrt(stiffness)) for every task.
 # There is no per-task YAML damping knob -- shape damping at runtime, per task, via the
 # WbcData `task_damping_ratio` field: it is the damping ratio zeta when stiffness > 0
 # (damping = 2*zeta*sqrt(stiffness), zeta=1 = critical), and the ABSOLUTE damping D when
 # stiffness = 0 (a zero-stiffness task then acts as a pure velocity damper -- e.g.
-# immobilize the base via the base posture task; see docs/gains.md). mc_rtc has no
-# generic "damping task" (mc_tasks::force::DampingTask is an admittance/force task).
+# immobilize the base via triorb_posture; see docs/gains.md). mc_rtc has no generic
+# "damping task" (mc_tasks::force::DampingTask is an admittance/force task).
 
 # How the base is driven: "velocity" (active -- from velocity_base) or "pose"
-# (inactive/overridable -- from the Base target [world] GUI marker / BASE_TARGET_KEY).
+# (inactive/overridable -- from the triorb_base target [world] GUI marker).
 base_command:
   mode: velocity
-
-# Base posture task -- light regularization of the base joints. Restricted to
-# base_x / base_y / base_yaw with selectActiveJoints.
-triorb_posture:
-  stiffness: 1.0
-  weight: 1.0
-
-# Robotiq gripper posture task -- holds the knuckle joints of the connected gripper.
-# Restricted to the gripper's own joints with selectActiveJoints. Only created when
-# `gripper.simulate` is on and the module could be connected.
-gripper_posture:
-  stiffness: 1.0
-  weight: 1.0
 
 # ---- Robotiq gripper -------------------------------------------------------
 # Two INDEPENDENT switches:
 #   simulate : CONNECT the gripper MODEL (a mc_robot_tools ConnectableRobotModule) onto
-#              the arm's `tool0` link, for visualization/collision. It becomes part of
-#              the merged robot rather than a separate one. On this branch it is OFF --
-#              we do not simulate the gripper.
+#              the arm's `tool0` link, so it becomes part of the merged robot. Its bodies,
+#              joints and surfaces are given a "gripper_" prefix. If this is on and the
+#              module cannot be loaded, construction FAILS loudly rather than silently
+#              running without it.
 #   command  : forward gripper_opening to the mc_robotiq GlobalPlugin datastore call
 #              `RobotiqGripper::setOpening` (0 = open, 1 = closed) to drive the REAL
-#              gripper. This does NOT need the model, so it stays ON.
+#              gripper. The plugin talks to it over a socket and moves no model joints, so
+#              this does NOT need the model and works with simulate: false.
 # Enable the RobotiqGripperPlugin in the global mc_rtc.yaml for the command path.
 gripper:
-  simulate: false                  # do not connect the mc_robot_tools gripper model
-  command: true                    # still drive the real gripper via the plugin
-  model: Robotiq2f85Gripper        # or Robotiq2f140Gripper (used only when simulate: true)
+  simulate: true                   # connect the mc_robot_tools gripper model
+  model: Robotiq2f85Gripper        # or Robotiq2f140Gripper
+  command: true                    # drive the real gripper via the plugin
   set_opening_call: "RobotiqGripper::setOpening"
 
 # ---- ROS2 command client ---------------------------------------------------
-# A WbcData message (std_msgs/Float64MultiArray, 20 doubles -- see WbcData.h) is
+# A WbcData message (std_msgs/Float64MultiArray, 32 doubles -- see WbcData.h) is
 # received on command_topic and applied every loop; measured state is republished
 # on measured_topic. The node spins on its own thread/context.
 ros:
@@ -117,7 +124,7 @@ ObserverPipelines:
         # installed (e.g. the isolated smoke test); on hardware/superbuild it loads and
         # appears in the pipeline summary. A warning is logged if it is missing.
         required: false
-        robot: callm            # the merged robot (see `connect.name` below)
+        robot: callm            # the merged robot (see `connect.name` above)
         topic: "/robot_pose_slam"
         expected_frame_id: ""    # empty = skip header.frame_id check
         world_X_map:             # pose of the VO/map frame in the controller world
